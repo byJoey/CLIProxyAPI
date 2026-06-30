@@ -982,14 +982,18 @@ const localCleanupCommand = "codex-prune-rollout-images --current-window --reque
 // remains too large after deterministic compression, return a local-only marker
 // for the executor to turn into a Codex tool call on Responses requests.
 func markPayloadTooLargeForLocalCleanup(out []byte) []byte {
-	if len(out) <= maxClaudePayloadBytesWithImages {
+	// 图片 base64 会在 executor 阶段上传 Files API 并替换为 file_id 引用,
+	// 真正出公网的请求体不含这些字节,因此超限判断要扣除图片体积,只在
+	// 非图片内容本身超过硬上限时才要求本地清理。
+	effectiveBytes := len(out) - claudeBase64ImageBytes(out)
+	if effectiveBytes <= maxClaudePayloadBytesWithImages {
 		return out
 	}
 
 	message := fmt.Sprintf(
 		"Claude request payload is %d bytes after image compression, exceeding the %d byte local safety limit. "+
 			"Do not strip images in the gateway. The agent must clean only the current Codex window by running: %s",
-		len(out),
+		effectiveBytes,
 		maxClaudePayloadBytesWithImages,
 		localCleanupCommand,
 	)
@@ -997,7 +1001,7 @@ func markPayloadTooLargeForLocalCleanup(out []byte) []byte {
 	errPayload, _ = sjson.SetBytes(errPayload, "error.message", message)
 	errPayload, _ = sjson.SetBytes(errPayload, "error.param", localCleanupCommand)
 	errPayload, _ = sjson.SetBytes(errPayload, "cliproxy_local_cleanup_required", true)
-	errPayload, _ = sjson.SetBytes(errPayload, "payload_bytes", len(out))
+	errPayload, _ = sjson.SetBytes(errPayload, "payload_bytes", effectiveBytes)
 	errPayload, _ = sjson.SetBytes(errPayload, "payload_limit_bytes", maxClaudePayloadBytesWithImages)
 	return errPayload
 }
@@ -1118,4 +1122,39 @@ func truncateLargeToolResults(out []byte) []byte {
 		return true
 	})
 	return out
+}
+
+// claudeBase64ImageBytes 统计 messages 中所有 base64 image 块的 data 字节长度,
+// 含 tool_result 内嵌图片。用于把图片体积从超限判断里扣除,因为这些图片随后会
+// 被 executor 上传 Files API 并替换为 file_id 引用。
+func claudeBase64ImageBytes(out []byte) int {
+	total := 0
+	addImage := func(part gjson.Result) {
+		if part.Get("type").String() != "image" {
+			return
+		}
+		source := part.Get("source")
+		if source.Get("type").String() != "base64" {
+			return
+		}
+		total += len(source.Get("data").String())
+	}
+	gjson.GetBytes(out, "messages").ForEach(func(_, msg gjson.Result) bool {
+		content := msg.Get("content")
+		if !content.IsArray() {
+			return true
+		}
+		content.ForEach(func(_, part gjson.Result) bool {
+			addImage(part)
+			if part.Get("type").String() == "tool_result" {
+				part.Get("content").ForEach(func(_, npart gjson.Result) bool {
+					addImage(npart)
+					return true
+				})
+			}
+			return true
+		})
+		return true
+	})
+	return total
 }

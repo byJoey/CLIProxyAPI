@@ -30,16 +30,13 @@ func TestMarkPayloadTooLargeForLocalCleanup_KeepsPayloadBelowHardLine(t *testing
 }
 
 func TestMarkPayloadTooLargeForLocalCleanup_ReturnsAgentActionAboveHardLine(t *testing.T) {
-	big := strings.Repeat("A", maxClaudePayloadBytesWithImages/2)
+	// 非图片文本内容本身超过硬上限时,扣除图片字节后仍应触发 cleanup marker。
+	big := strings.Repeat("A", maxClaudePayloadBytesWithImages+1024)
 	out := []byte(`{"messages":[]}`)
 
-	userImage := []byte(`{"role":"user","content":[{"type":"image","source":{"type":"base64","media_type":"image/png","data":""}}]}`)
-	userImage, _ = sjson.SetBytes(userImage, "content.0.source.data", big)
-	out, _ = sjson.SetRawBytes(out, "messages.-1", userImage)
-
-	toolResultImage := []byte(`{"role":"user","content":[{"type":"tool_result","tool_use_id":"t","content":[{"type":"image","source":{"type":"base64","media_type":"image/png","data":""}}]}]}`)
-	toolResultImage, _ = sjson.SetBytes(toolResultImage, "content.0.content.0.source.data", big)
-	out, _ = sjson.SetRawBytes(out, "messages.-1", toolResultImage)
+	userText := []byte(`{"role":"user","content":[{"type":"text","text":""}]}`)
+	userText, _ = sjson.SetBytes(userText, "content.0.text", big)
+	out, _ = sjson.SetRawBytes(out, "messages.-1", userText)
 
 	got := markPayloadTooLargeForLocalCleanup(out)
 
@@ -157,5 +154,35 @@ func TestCompressBase64PNGImagesToJPEG_DownscalesLongEdge(t *testing.T) {
 	}
 	if cfg.Width != maxScreenshotLongEdge {
 		t.Fatalf("expected width %d, got %d", maxScreenshotLongEdge, cfg.Width)
+	}
+}
+
+func TestMarkPayloadTooLargeForLocalCleanup_ExcludesImageBytesFromThreshold(t *testing.T) {
+	// 构造一张超过硬上限的大图,但非图片内容很小。扣除图片字节后应当不触发
+	// cleanup marker,因为图片会在 executor 阶段被替换为 file_id。
+	big := strings.Repeat("A", maxClaudePayloadBytesWithImages+2*1024*1024)
+	out := []byte(`{"messages":[]}`)
+	userImage := []byte(`{"role":"user","content":[{"type":"image","source":{"type":"base64","media_type":"image/png","data":""}}]}`)
+	userImage, _ = sjson.SetBytes(userImage, "content.0.source.data", big)
+	out, _ = sjson.SetRawBytes(out, "messages.-1", userImage)
+
+	got := markPayloadTooLargeForLocalCleanup(out)
+	if gjson.GetBytes(got, "cliproxy_local_cleanup_required").Bool() {
+		t.Fatalf("oversized images must not trigger cleanup; payload head=%s", string(got)[:120])
+	}
+	if gjson.GetBytes(got, "messages.0.content.0.source.data").String() != big {
+		t.Fatalf("payload should be returned unchanged when only images are large")
+	}
+}
+
+func TestClaudeBase64ImageBytes_CountsNestedToolResult(t *testing.T) {
+	out := []byte(`{"messages":[]}`)
+	top := []byte(`{"role":"user","content":[{"type":"image","source":{"type":"base64","media_type":"image/png","data":"AAAA"}}]}`)
+	out, _ = sjson.SetRawBytes(out, "messages.-1", top)
+	tool := []byte(`{"role":"user","content":[{"type":"tool_result","content":[{"type":"image","source":{"type":"base64","media_type":"image/png","data":"BBBBBB"}}]}]}`)
+	out, _ = sjson.SetRawBytes(out, "messages.-1", tool)
+
+	if got := claudeBase64ImageBytes(out); got != len("AAAA")+len("BBBBBB") {
+		t.Fatalf("image bytes = %d, want %d", got, len("AAAA")+len("BBBBBB"))
 	}
 }
