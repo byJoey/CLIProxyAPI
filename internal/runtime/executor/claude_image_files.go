@@ -12,6 +12,7 @@ import (
 	"net/http"
 	"net/textproto"
 	"strings"
+	"time"
 
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/cache"
 	cliproxyauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
@@ -37,12 +38,14 @@ const claudeImageFileMinBytes = 4 * 1024
 //   - 仅处理 source.type==base64 的 image 块,已是 file 引用的跳过。
 func (e *ClaudeExecutor) uploadClaudeImagesToFileIDs(ctx context.Context, auth *cliproxyauth.Auth, body []byte, baseModel string) (out []byte, changed bool) {
 	out = body
+	accountKey := claudeImageAccountKey(auth)
+	// 借本次请求的账号凭证清理过期淘汰登记的孤儿文件(异步、不阻塞)。
+	e.cleanupClaudeImageOrphans(auth, accountKey)
+
 	messages := gjson.GetBytes(out, "messages")
 	if !messages.IsArray() {
 		return out, false
 	}
-
-	accountKey := claudeImageAccountKey(auth)
 
 	messages.ForEach(func(mi, message gjson.Result) bool {
 		content := message.Get("content")
@@ -237,4 +240,59 @@ func appendBetaIfMissing(betas []string, beta string) []string {
 		}
 	}
 	return append(betas, beta)
+}
+
+// deleteClaudeImageFile 删除 Anthropic Files API 上的一个文件。用于清理过期
+// 缓存对应的孤儿文件,避免长期攒在账号下产生存储费。
+func (e *ClaudeExecutor) deleteClaudeImageFile(ctx context.Context, auth *cliproxyauth.Auth, fileID string) error {
+	if fileID == "" {
+		return nil
+	}
+	_, baseURL := claudeCreds(auth)
+	if baseURL == "" {
+		baseURL = "https://api.anthropic.com"
+	}
+	url := fmt.Sprintf("%s/v1/files/%s", strings.TrimRight(baseURL, "/"), fileID)
+	httpReq, err := http.NewRequestWithContext(ctx, http.MethodDelete, url, nil)
+	if err != nil {
+		return err
+	}
+	httpReq.Header.Set("anthropic-version", "2023-06-01")
+	httpReq.Header.Set("anthropic-beta", claudeFilesAPIBeta)
+	if err = e.PrepareRequest(httpReq, auth); err != nil {
+		return err
+	}
+	httpReq.Header.Del("Accept-Encoding")
+	httpResp, err := e.HttpRequest(ctx, auth, httpReq)
+	if err != nil {
+		return err
+	}
+	defer httpResp.Body.Close()
+	_, _ = io.Copy(io.Discard, httpResp.Body)
+	// 404 视为已删除,幂等。
+	if httpResp.StatusCode >= 200 && httpResp.StatusCode < 300 {
+		return nil
+	}
+	if httpResp.StatusCode == http.StatusNotFound {
+		return nil
+	}
+	return fmt.Errorf("claude files delete failed: status=%d", httpResp.StatusCode)
+}
+
+// cleanupClaudeImageOrphans 取出该账号下过期淘汰登记的孤儿文件并异步删除。
+// 用后台 context,避免阻塞当前请求;失败仅记日志,不影响主流程。
+func (e *ClaudeExecutor) cleanupClaudeImageOrphans(auth *cliproxyauth.Auth, accountKey string) {
+	orphans := cache.DrainClaudeImageOrphans(accountKey)
+	if len(orphans) == 0 {
+		return
+	}
+	go func(ids []string) {
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cancel()
+		for _, id := range ids {
+			if err := e.deleteClaudeImageFile(ctx, auth, id); err != nil {
+				log.WithError(err).WithField("file_id", id).Debug("claude orphan image delete failed")
+			}
+		}
+	}(orphans)
 }

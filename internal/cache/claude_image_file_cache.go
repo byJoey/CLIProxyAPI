@@ -21,8 +21,9 @@ import (
 
 const (
 	// ClaudeImageFileCacheTTL 是单条 file_id 映射的有效期。Anthropic Files API
-	// 上传的文件长期可用,这里取较长 TTL,过期只是为了回收资源。
-	ClaudeImageFileCacheTTL = 24 * time.Hour
+	// 上传的文件不会自动过期,只能显式删除,因此这里取较长 TTL(7 天)以减少
+	// 重复上传;条目过期淘汰时会把对应文件登记为待删,交由后续同账号请求清理。
+	ClaudeImageFileCacheTTL = 7 * 24 * time.Hour
 
 	// claudeImageFileCacheCleanupInterval 控制后台清理过期条目的频率。
 	claudeImageFileCacheCleanupInterval = 30 * time.Minute
@@ -237,8 +238,12 @@ func startClaudeImageFileCacheCleanup() {
 			now := time.Now()
 			removed := false
 			claudeImageFileCache.Range(func(k, v any) bool {
-				if now.After(v.(claudeImageFileEntry).expiresAt) {
+				entry := v.(claudeImageFileEntry)
+				if now.After(entry.expiresAt) {
 					claudeImageFileCache.Delete(k)
+					if ak, ok := accountKeyFromCacheKey(k.(string)); ok {
+						enqueueClaudeImageOrphan(ak, entry.fileID)
+					}
 					removed = true
 				}
 				return true
@@ -258,4 +263,58 @@ func reloadClaudeImageFileCacheForTest() {
 	claudeImageFileDiskLoaded = false
 	claudeImageFileDiskMu.Unlock()
 	loadClaudeImageFileCacheFromDisk()
+}
+
+// 孤儿文件队列:缓存条目过期淘汰后,其 file_id 对应的 Anthropic 远端文件不再被
+// 引用。后台清理协程没有账号凭证,无法直接删除,因此把待删 file_id 按账号登记;
+// executor 在处理该账号下一次请求时取出并调用 DELETE /v1/files 清理,避免攒孤儿。
+var claudeImageOrphans sync.Map // accountKey string -> *[]string(受 mu 保护需简单串行,这里用专用锁)
+
+var claudeImageOrphanMu sync.Mutex
+
+// enqueueClaudeImageOrphan 登记一个待删除的 file_id。
+func enqueueClaudeImageOrphan(accountKey, fileID string) {
+	if accountKey == "" || fileID == "" {
+		return
+	}
+	claudeImageOrphanMu.Lock()
+	defer claudeImageOrphanMu.Unlock()
+	existing, _ := claudeImageOrphans.Load(accountKey)
+	var list []string
+	if existing != nil {
+		list = existing.([]string)
+	}
+	list = append(list, fileID)
+	claudeImageOrphans.Store(accountKey, list)
+}
+
+// DrainClaudeImageOrphans 取出并清空某账号下所有待删 file_id,交给调用方删除。
+func DrainClaudeImageOrphans(accountKey string) []string {
+	if accountKey == "" {
+		return nil
+	}
+	claudeImageOrphanMu.Lock()
+	defer claudeImageOrphanMu.Unlock()
+	existing, ok := claudeImageOrphans.Load(accountKey)
+	if !ok {
+		return nil
+	}
+	claudeImageOrphans.Delete(accountKey)
+	if existing == nil {
+		return nil
+	}
+	return existing.([]string)
+}
+
+// accountKeyFromCacheKey 从缓存 key(account|sha256)中拆出 account 部分。
+func accountKeyFromCacheKey(key string) (string, bool) {
+	for i := len(key) - 1; i >= 0; i-- {
+		if key[i] == '|' {
+			if i == 0 {
+				return "", false
+			}
+			return key[:i], true
+		}
+	}
+	return "", false
 }

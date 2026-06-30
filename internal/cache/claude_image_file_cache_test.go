@@ -51,3 +51,37 @@ func TestClaudeImageFileCachePersistsAcrossReload(t *testing.T) {
 		t.Fatalf("after reload get = %q,%v, want file_persist,true", id, ok)
 	}
 }
+
+func TestClaudeImageOrphanQueueEnqueueDrain(t *testing.T) {
+	// 登记两个孤儿,drain 应一次性取出并清空。
+	enqueueClaudeImageOrphan("acctA", "file_x")
+	enqueueClaudeImageOrphan("acctA", "file_y")
+	enqueueClaudeImageOrphan("acctB", "file_z")
+
+	got := DrainClaudeImageOrphans("acctA")
+	if len(got) != 2 || got[0] != "file_x" || got[1] != "file_y" {
+		t.Fatalf("drain acctA = %v, want [file_x file_y]", got)
+	}
+	// 再次 drain 应为空(已清空)。
+	if again := DrainClaudeImageOrphans("acctA"); len(again) != 0 {
+		t.Fatalf("second drain = %v, want empty", again)
+	}
+	// 账号隔离:acctB 不受影响。
+	if b := DrainClaudeImageOrphans("acctB"); len(b) != 1 || b[0] != "file_z" {
+		t.Fatalf("drain acctB = %v, want [file_z]", b)
+	}
+}
+
+func TestAccountKeyFromCacheKey(t *testing.T) {
+	// account 部分含点和邮箱,sha256 为 hex,用最后一个 | 拆分。
+	acct, ok := accountKeyFromCacheKey("claude-user@x.com.json|abcdef123456")
+	if !ok || acct != "claude-user@x.com.json" {
+		t.Fatalf("account = %q,%v", acct, ok)
+	}
+	if _, ok := accountKeyFromCacheKey("no-separator"); ok {
+		t.Fatal("expected failure when no separator")
+	}
+	if _, ok := accountKeyFromCacheKey("|onlysha"); ok {
+		t.Fatal("expected failure when account empty")
+	}
+}
