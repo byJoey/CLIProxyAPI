@@ -236,6 +236,9 @@ func (e *ClaudeExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, r
 	if opts.Alt == "responses/compact" {
 		return resp, statusErr{code: http.StatusNotImplemented, msg: "/responses/compact not supported"}
 	}
+	if opts.Alt == "claude/files" {
+		return e.executeFileUpload(ctx, auth, req, opts)
+	}
 	baseModel := thinking.ParseSuffix(req.Model).ModelName
 
 	apiKey, baseURL := claudeCreds(auth)
@@ -425,6 +428,41 @@ func (e *ClaudeExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, r
 	)
 	resp = cliproxyexecutor.Response{Payload: out, Headers: httpResp.Header.Clone()}
 	return resp, nil
+}
+
+func (e *ClaudeExecutor) executeFileUpload(ctx context.Context, auth *cliproxyauth.Auth, req cliproxyexecutor.Request, opts cliproxyexecutor.Options) (cliproxyexecutor.Response, error) {
+	_, baseURL := claudeCreds(auth)
+	if baseURL == "" {
+		baseURL = "https://api.anthropic.com"
+	}
+	url := fmt.Sprintf("%s/v1/files", strings.TrimRight(baseURL, "/"))
+	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(req.Payload))
+	if err != nil {
+		return cliproxyexecutor.Response{}, err
+	}
+	if contentType := strings.TrimSpace(opts.Headers.Get("Content-Type")); contentType != "" {
+		httpReq.Header.Set("Content-Type", contentType)
+	}
+	httpReq.Header.Set("anthropic-version", "2023-06-01")
+	httpReq.Header.Set("anthropic-beta", "files-api-2025-04-14")
+	if err := e.PrepareRequest(httpReq, auth); err != nil {
+		return cliproxyexecutor.Response{}, err
+	}
+	httpReq.Header.Del("Accept-Encoding")
+
+	httpResp, err := e.HttpRequest(ctx, auth, httpReq)
+	if err != nil {
+		return cliproxyexecutor.Response{}, err
+	}
+	defer httpResp.Body.Close()
+	body, err := io.ReadAll(httpResp.Body)
+	if err != nil {
+		return cliproxyexecutor.Response{}, err
+	}
+	if httpResp.StatusCode < 200 || httpResp.StatusCode >= 300 {
+		return cliproxyexecutor.Response{}, statusErr{code: httpResp.StatusCode, msg: string(body)}
+	}
+	return cliproxyexecutor.Response{Payload: body, Headers: httpResp.Header.Clone()}, nil
 }
 
 func (e *ClaudeExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Auth, req cliproxyexecutor.Request, opts cliproxyexecutor.Options) (_ *cliproxyexecutor.StreamResult, err error) {

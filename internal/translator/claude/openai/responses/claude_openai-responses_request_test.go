@@ -262,6 +262,30 @@ func TestConvertOpenAIResponsesRequestToClaude_DropsApplyPatchCustomTool(t *test
 	}
 }
 
+func TestConvertOpenAIResponsesRequestToClaude_InputImageFileID(t *testing.T) {
+	raw := []byte(`{
+		"model":"claude-test",
+		"input":[{
+			"type":"message",
+			"role":"user",
+			"content":[{"type":"input_image","file_id":"file_img_123"}]
+		}]
+	}`)
+
+	out := ConvertOpenAIResponsesRequestToClaude("claude-test", raw, false)
+	root := gjson.ParseBytes(out)
+
+	if got := root.Get("messages.0.content.0.type").String(); got != "image" {
+		t.Fatalf("content type = %q, want image. Output: %s", got, string(out))
+	}
+	if got := root.Get("messages.0.content.0.source.type").String(); got != "file" {
+		t.Fatalf("source type = %q, want file. Output: %s", got, string(out))
+	}
+	if got := root.Get("messages.0.content.0.source.file_id").String(); got != "file_img_123" {
+		t.Fatalf("file_id = %q, want file_img_123. Output: %s", got, string(out))
+	}
+}
+
 func testClaudeResponsesThinkingSignature(t *testing.T) (string, string) {
 	t.Helper()
 	channelBlock := []byte{}

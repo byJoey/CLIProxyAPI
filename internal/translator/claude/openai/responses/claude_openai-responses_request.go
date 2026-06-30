@@ -256,6 +256,20 @@ func ConvertOpenAIResponsesRequestToClaude(modelName string, inputRawJSON []byte
 								role = "assistant"
 							}
 						case "input_image":
+							fileID := strings.TrimSpace(part.Get("file_id").String())
+							if fileID == "" {
+								fileID = strings.TrimSpace(part.Get("image_url.file_id").String())
+							}
+							if fileID != "" {
+								contentPart := []byte(`{"type":"image","source":{"type":"file","file_id":""}}`)
+								contentPart, _ = sjson.SetBytes(contentPart, "source.file_id", fileID)
+								partsJSON = append(partsJSON, string(contentPart))
+								if role == "" {
+									role = "user"
+								}
+								hasImage = true
+								break
+							}
 							url := part.Get("image_url").String()
 							if url == "" {
 								url = part.Get("url").String()
