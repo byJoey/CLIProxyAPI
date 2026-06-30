@@ -5,6 +5,7 @@ import (
 	"bytes"
 	"context"
 	"fmt"
+	"os"
 	"strings"
 	"time"
 
@@ -544,6 +545,8 @@ func ConvertClaudeResponseToOpenAIResponses(ctx context.Context, modelName strin
 		usagePresent := st.Usage.HasUsage || reasoningTokens > 0
 		if usagePresent {
 			inputTokens, outputTokens, totalTokens, cachedTokens := st.Usage.OpenAIResponsesUsage()
+			fmt.Fprintf(os.Stderr, "[CACHE] input=%d output=%d cached=%d cache_create=%d cache_read=%d\n", inputTokens, outputTokens, cachedTokens, st.Usage.CacheCreationInputTokens, st.Usage.CacheReadInputTokens)
+
 			completed, _ = sjson.SetBytes(completed, "response.usage.input_tokens", inputTokens)
 			completed, _ = sjson.SetBytes(completed, "response.usage.input_tokens_details.cached_tokens", cachedTokens)
 			completed, _ = sjson.SetBytes(completed, "response.usage.output_tokens", outputTokens)

@@ -1,12 +1,22 @@
 package responses
 
 import (
+	"bytes"
 	"crypto/rand"
 	"crypto/sha256"
+	"encoding/base64"
 	"encoding/hex"
 	"fmt"
+	"image"
+	"image/color"
+	"image/draw"
+	"image/jpeg"
+	_ "image/png"
 	"math/big"
+	"os"
+	"path/filepath"
 	"strings"
+	"sync/atomic"
 
 	"github.com/google/uuid"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/registry"
@@ -15,6 +25,8 @@ import (
 	"github.com/tidwall/gjson"
 	"github.com/tidwall/sjson"
 )
+
+var dumpCounter int64
 
 var (
 	user    = ""
@@ -476,7 +488,13 @@ func ConvertOpenAIResponsesRequestToClaude(modelName string, inputRawJSON []byte
 	out = normalizeMessageContent(out)
 	out = stripModelSwitchPrompt(out)
 	out = truncateLargeToolResults(out)
+	out = compressBase64PNGImagesToJPEG(out)
 	out = stripOldImages(out)
+
+	if dumpDir := os.Getenv("CLAUDE_RESPONSES_DUMP_DIR"); dumpDir != "" {
+		n := atomic.AddInt64(&dumpCounter, 1)
+		_ = os.WriteFile(filepath.Join(dumpDir, fmt.Sprintf("claude_out_%d.json", n)), out, 0o644)
+	}
 
 	return out
 }
@@ -780,57 +798,181 @@ func isUnsupportedOpenAIBuiltinToolType(toolType string) bool {
 	}
 }
 
-// maxRetainedUserImageTurns controls how many recent user turns keep their
-// images. Older user turns have images replaced with a placeholder. This
-// balances cache stability (fewer replacements = fewer cache rebuilds) against
-// request size growth (more images = larger payload).
-const maxRetainedUserImageTurns = 6
+const (
+	jpegScreenshotQuality = 75
+	maxScreenshotLongEdge = 1600
+)
 
-// stripOldImages keeps images only in the most recent N user turns (counted by
-// role:"user" messages). All earlier user turn images are replaced with
-// [image omitted]. A hard 28MB byte cap acts as a safety net for extreme cases.
-func stripOldImages(out []byte) []byte {
-	placeholder := []byte(`{"type":"text","text":"[image omitted]"}`)
+type base64ImagePath struct {
+	mediaTypePath string
+	dataPath      string
+}
 
-	// Collect indices of all user messages.
-	var userTurnIndices []int64
-	gjson.GetBytes(out, "messages").ForEach(func(mi, msg gjson.Result) bool {
-		if msg.Get("role").String() == "user" {
-			userTurnIndices = append(userTurnIndices, mi.Int())
+// compressBase64PNGImagesToJPEG converts inline PNG screenshots to stable JPEG
+// payloads before the hard payload cap is applied. JPEG inputs are left alone
+// to avoid repeated lossy re-encoding across turns.
+func compressBase64PNGImagesToJPEG(out []byte) []byte {
+	for _, path := range base64ImagePaths(out) {
+		mediaType := strings.ToLower(strings.TrimSpace(gjson.GetBytes(out, path.mediaTypePath).String()))
+		if mediaType != "image/png" && mediaType != "image/x-png" {
+			continue
 		}
+		data := gjson.GetBytes(out, path.dataPath).String()
+		jpegData, ok := compressPNGBase64ToJPEGBase64(data)
+		if !ok || len(jpegData) >= len(data) {
+			continue
+		}
+		var err error
+		out, err = sjson.SetBytes(out, path.mediaTypePath, "image/jpeg")
+		if err != nil {
+			continue
+		}
+		out, err = sjson.SetBytes(out, path.dataPath, jpegData)
+		if err != nil {
+			continue
+		}
+	}
+	return out
+}
+
+func base64ImagePaths(out []byte) []base64ImagePath {
+	var paths []base64ImagePath
+	gjson.GetBytes(out, "messages").ForEach(func(mi, msg gjson.Result) bool {
+		content := msg.Get("content")
+		if !content.IsArray() {
+			return true
+		}
+		content.ForEach(func(ci, part gjson.Result) bool {
+			switch part.Get("type").String() {
+			case "image":
+				if part.Get("source.type").String() == "base64" {
+					base := fmt.Sprintf("messages.%d.content.%d.source", mi.Int(), ci.Int())
+					paths = append(paths, base64ImagePath{
+						mediaTypePath: base + ".media_type",
+						dataPath:      base + ".data",
+					})
+				}
+			case "tool_result":
+				inner := part.Get("content")
+				if inner.IsArray() {
+					inner.ForEach(func(ii, ipart gjson.Result) bool {
+						if ipart.Get("type").String() == "image" && ipart.Get("source.type").String() == "base64" {
+							base := fmt.Sprintf("messages.%d.content.%d.content.%d.source", mi.Int(), ci.Int(), ii.Int())
+							paths = append(paths, base64ImagePath{
+								mediaTypePath: base + ".media_type",
+								dataPath:      base + ".data",
+							})
+						}
+						return true
+					})
+				}
+			}
+			return true
+		})
 		return true
 	})
+	return paths
+}
 
-	// Determine cutoff: keep the last maxRetainedUserImageTurns user turns.
-	cutoff := len(userTurnIndices) - maxRetainedUserImageTurns
-	if cutoff <= 0 {
-		// Fewer than N user turns total; nothing to strip.
-		cutoff = 0
+func compressPNGBase64ToJPEGBase64(data string) (string, bool) {
+	raw, err := base64.StdEncoding.DecodeString(data)
+	if err != nil {
+		return "", false
 	}
-	cutoffMsgIdx := int64(-1)
-	if cutoff > 0 {
-		cutoffMsgIdx = userTurnIndices[cutoff]
+	img, format, err := image.Decode(bytes.NewReader(raw))
+	if err != nil || format != "png" {
+		return "", false
 	}
 
-	// Replace images in messages before the cutoff.
-	if cutoffMsgIdx > 0 {
-		for {
-			path := firstImagePathBefore(out, cutoffMsgIdx)
-			if path == "" {
-				break
+	bounds := img.Bounds()
+	flattened := image.NewRGBA(image.Rect(0, 0, bounds.Dx(), bounds.Dy()))
+	draw.Draw(flattened, flattened.Bounds(), &image.Uniform{C: color.White}, image.Point{}, draw.Src)
+	draw.Draw(flattened, flattened.Bounds(), img, bounds.Min, draw.Over)
+
+	scaled := downscaleToLongEdge(flattened, maxScreenshotLongEdge)
+
+	var buf bytes.Buffer
+	if err := jpeg.Encode(&buf, scaled, &jpeg.Options{Quality: jpegScreenshotQuality}); err != nil {
+		return "", false
+	}
+	return base64.StdEncoding.EncodeToString(buf.Bytes()), true
+}
+
+// downscaleToLongEdge returns a deterministic box-averaged copy of src whose
+// longest edge is at most longEdge. Images already within the limit are
+// returned unchanged so the transform stays idempotent.
+func downscaleToLongEdge(src *image.RGBA, longEdge int) *image.RGBA {
+	w := src.Bounds().Dx()
+	h := src.Bounds().Dy()
+	if longEdge <= 0 || (w <= longEdge && h <= longEdge) {
+		return src
+	}
+
+	dw, dh := w, h
+	if w >= h {
+		dw = longEdge
+		dh = (h*longEdge + w/2) / w
+	} else {
+		dh = longEdge
+		dw = (w*longEdge + h/2) / h
+	}
+	if dw < 1 {
+		dw = 1
+	}
+	if dh < 1 {
+		dh = 1
+	}
+
+	dst := image.NewRGBA(image.Rect(0, 0, dw, dh))
+	for dy := 0; dy < dh; dy++ {
+		sy0 := dy * h / dh
+		sy1 := (dy + 1) * h / dh
+		if sy1 <= sy0 {
+			sy1 = sy0 + 1
+		}
+		for dx := 0; dx < dw; dx++ {
+			sx0 := dx * w / dw
+			sx1 := (dx + 1) * w / dw
+			if sx1 <= sx0 {
+				sx1 = sx0 + 1
 			}
-			nb, err := sjson.SetRawBytes(out, path, placeholder)
-			if err != nil {
-				break
+			var rsum, gsum, bsum, asum, count uint64
+			for sy := sy0; sy < sy1; sy++ {
+				row := src.PixOffset(src.Bounds().Min.X+sx0, src.Bounds().Min.Y+sy)
+				for sx := sx0; sx < sx1; sx++ {
+					i := row + (sx-sx0)*4
+					rsum += uint64(src.Pix[i])
+					gsum += uint64(src.Pix[i+1])
+					bsum += uint64(src.Pix[i+2])
+					asum += uint64(src.Pix[i+3])
+					count++
+				}
 			}
-			out = nb
+			di := dst.PixOffset(dx, dy)
+			dst.Pix[di] = uint8(rsum / count)
+			dst.Pix[di+1] = uint8(gsum / count)
+			dst.Pix[di+2] = uint8(bsum / count)
+			dst.Pix[di+3] = uint8(asum / count)
 		}
 	}
+	return dst
+}
 
-	// Hard 28MB cap as safety net.
-	const limit = 28 * 1024 * 1024
-	for len(out) > limit {
-		path := firstImagePathBefore(out, -1)
+const maxClaudePayloadBytesWithImages = 31 * 1024 * 1024
+
+// stripOldImages keeps image payloads untouched unless the converted Claude
+// request crosses the hard payload line. If it does, all image blocks are
+// removed in one pass so cache invalidation happens as a single event instead
+// of repeatedly as old image turns slide through the conversation.
+func stripOldImages(out []byte) []byte {
+	if len(out) <= maxClaudePayloadBytesWithImages {
+		return out
+	}
+
+	placeholder := []byte(`{"type":"text","text":"[image omitted]"}`)
+
+	for {
+		path := firstImagePath(out)
 		if path == "" {
 			break
 		}
@@ -843,14 +985,11 @@ func stripOldImages(out []byte) []byte {
 	return out
 }
 
-// firstImagePathBefore returns the sjson path of the first image block in
-// messages with index < beforeIdx. Pass beforeIdx == -1 to match all messages.
-func firstImagePathBefore(out []byte, beforeIdx int64) string {
+// firstImagePath returns the sjson path of the first image block anywhere in
+// the messages array, including images nested inside tool_result content.
+func firstImagePath(out []byte) string {
 	found := ""
 	gjson.GetBytes(out, "messages").ForEach(func(mi, msg gjson.Result) bool {
-		if beforeIdx >= 0 && mi.Int() >= beforeIdx {
-			return false // stop: reached the protected turn
-		}
 		content := msg.Get("content")
 		if !content.IsArray() {
 			return true

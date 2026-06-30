@@ -1,6 +1,11 @@
 package responses
 
 import (
+	"bytes"
+	"encoding/base64"
+	"image"
+	"image/color"
+	"image/png"
 	"strings"
 	"testing"
 
@@ -8,104 +13,149 @@ import (
 	"github.com/tidwall/sjson"
 )
 
-func TestStripOldImages_KeepsLastNUserTurns(t *testing.T) {
-	big := strings.Repeat("A", 1024)
+func TestStripOldImages_KeepsAllImagesBelowHardLine(t *testing.T) {
 	out := []byte(`{"messages":[]}`)
-
-	// Create 8 user turns with images, interleaved with assistant messages.
 	for i := 0; i < 8; i++ {
-		// user with image
-		m := []byte(`{"role":"user","content":[{"type":"image","source":{"type":"base64","media_type":"image/png","data":""}},{"type":"text","text":""}]}`)
-		m, _ = sjson.SetBytes(m, "content.0.source.data", big)
-		m, _ = sjson.SetBytes(m, "content.1.text", strings.Repeat("x", i))
+		m := []byte(`{"role":"user","content":[{"type":"image","source":{"type":"base64","media_type":"image/png","data":"QUJD"}}]}`)
 		out, _ = sjson.SetRawBytes(out, "messages.-1", m)
-		// assistant reply
-		out, _ = sjson.SetRawBytes(out, "messages.-1", []byte(`{"role":"assistant","content":[{"type":"text","text":"ok"}]}`))
 	}
 
 	got := stripOldImages(out)
 
-	// 8 user turns, keep last 6 => first 2 user turns (msg index 0, 2) should be stripped
-	// msg[0] = user turn 0 -> stripped
-	if ty := gjson.GetBytes(got, "messages.0.content.0.type").String(); ty != "text" {
-		t.Fatalf("user turn 0 image should be stripped, got type=%s", ty)
-	}
-	if txt := gjson.GetBytes(got, "messages.0.content.0.text").String(); !strings.Contains(txt, "omitted") {
-		t.Fatalf("user turn 0 should have placeholder, got %s", txt)
-	}
-	// msg[2] = user turn 1 -> stripped
-	if ty := gjson.GetBytes(got, "messages.2.content.0.type").String(); ty != "text" {
-		t.Fatalf("user turn 1 image should be stripped, got type=%s", ty)
-	}
-
-	// msg[4] = user turn 2 -> kept (part of last 6)
-	if ty := gjson.GetBytes(got, "messages.4.content.0.type").String(); ty != "image" {
-		t.Fatalf("user turn 2 image should be kept, got type=%s", ty)
-	}
-	// msg[14] = user turn 7 (last) -> kept
-	if ty := gjson.GetBytes(got, "messages.14.content.0.type").String(); ty != "image" {
-		t.Fatalf("last user turn image should be kept, got type=%s", ty)
-	}
-}
-
-func TestStripOldImages_FewerThanNTurns(t *testing.T) {
-	big := strings.Repeat("A", 1024)
-	out := []byte(`{"messages":[]}`)
-
-	// Only 3 user turns (< 6), all images should survive
-	for i := 0; i < 3; i++ {
-		m := []byte(`{"role":"user","content":[{"type":"image","source":{"type":"base64","media_type":"image/png","data":""}}]}`)
-		m, _ = sjson.SetBytes(m, "content.0.source.data", big)
-		out, _ = sjson.SetRawBytes(out, "messages.-1", m)
-		out, _ = sjson.SetRawBytes(out, "messages.-1", []byte(`{"role":"assistant","content":[{"type":"text","text":"ok"}]}`))
-	}
-
-	got := stripOldImages(out)
-
-	for i := 0; i < 3; i++ {
-		idx := i * 2
-		if ty := gjson.GetBytes(got, "messages."+string(rune('0'+idx))+".content.0.type").String(); ty != "image" {
-			t.Fatalf("user turn %d image should be kept (fewer than 6 turns), got type=%s", i, ty)
+	for i := 0; i < 8; i++ {
+		if ty := gjson.GetBytes(got, "messages."+string(rune('0'+i))+".content.0.type").String(); ty != "image" {
+			t.Fatalf("image in message %d should be kept below hard line, got type=%s", i, ty)
 		}
 	}
 }
 
-func TestStripOldImages_NestedToolResult(t *testing.T) {
-	big := strings.Repeat("A", 1024)
+func TestStripOldImages_RemovesAllImagesAboveHardLine(t *testing.T) {
+	big := strings.Repeat("A", maxClaudePayloadBytesWithImages/2)
 	out := []byte(`{"messages":[]}`)
 
-	// 8 user turns, images in tool_result
-	for i := 0; i < 8; i++ {
-		tr := []byte(`{"role":"user","content":[{"type":"tool_result","tool_use_id":"t","content":[{"type":"image","source":{"type":"base64","media_type":"image/png","data":""}}]}]}`)
-		tr, _ = sjson.SetBytes(tr, "content.0.content.0.source.data", big)
-		out, _ = sjson.SetRawBytes(out, "messages.-1", tr)
-		out, _ = sjson.SetRawBytes(out, "messages.-1", []byte(`{"role":"assistant","content":[{"type":"text","text":"ok"}]}`))
-	}
+	userImage := []byte(`{"role":"user","content":[{"type":"image","source":{"type":"base64","media_type":"image/png","data":""}}]}`)
+	userImage, _ = sjson.SetBytes(userImage, "content.0.source.data", big)
+	out, _ = sjson.SetRawBytes(out, "messages.-1", userImage)
+
+	toolResultImage := []byte(`{"role":"user","content":[{"type":"tool_result","tool_use_id":"t","content":[{"type":"image","source":{"type":"base64","media_type":"image/png","data":""}}]}]}`)
+	toolResultImage, _ = sjson.SetBytes(toolResultImage, "content.0.content.0.source.data", big)
+	out, _ = sjson.SetRawBytes(out, "messages.-1", toolResultImage)
 
 	got := stripOldImages(out)
 
-	// First 2 user turns should be stripped
-	if ty := gjson.GetBytes(got, "messages.0.content.0.content.0.type").String(); ty != "text" {
-		t.Fatalf("nested image in turn 0 should be stripped, got type=%s", ty)
+	if ty := gjson.GetBytes(got, "messages.0.content.0.type").String(); ty != "text" {
+		t.Fatalf("top-level image should be replaced above hard line, got type=%s", ty)
 	}
-	// Last user turn should be kept
-	if ty := gjson.GetBytes(got, "messages.14.content.0.content.0.type").String(); ty != "image" {
-		t.Fatalf("nested image in last turn should be kept, got type=%s", ty)
+	if txt := gjson.GetBytes(got, "messages.0.content.0.text").String(); txt != "[image omitted]" {
+		t.Fatalf("top-level image placeholder = %q", txt)
+	}
+	if ty := gjson.GetBytes(got, "messages.1.content.0.content.0.type").String(); ty != "text" {
+		t.Fatalf("nested tool_result image should be replaced above hard line, got type=%s", ty)
+	}
+	if strings.Contains(string(got), big) {
+		t.Fatalf("image source data should not remain after hard-line stripping")
 	}
 }
 
-func TestStripOldImages_28MBCap(t *testing.T) {
-	big := strings.Repeat("A", 15*1024*1024)
+func TestCompressBase64PNGImagesToJPEG_CompressesAndIsStable(t *testing.T) {
+	pngData := testPNGBase64(t)
 	out := []byte(`{"messages":[]}`)
 
-	// Single user message with two huge images (within last 6 turns but over 28MB)
-	m := []byte(`{"role":"user","content":[{"type":"image","source":{"type":"base64","media_type":"image/png","data":""}},{"type":"image","source":{"type":"base64","media_type":"image/png","data":""}}]}`)
-	m, _ = sjson.SetBytes(m, "content.0.source.data", big)
-	m, _ = sjson.SetBytes(m, "content.1.source.data", big)
-	out, _ = sjson.SetRawBytes(out, "messages.-1", m)
+	userImage := []byte(`{"role":"user","content":[{"type":"image","source":{"type":"base64","media_type":"image/png","data":""}}]}`)
+	userImage, _ = sjson.SetBytes(userImage, "content.0.source.data", pngData)
+	out, _ = sjson.SetRawBytes(out, "messages.-1", userImage)
 
-	got := stripOldImages(out)
-	if len(got) > 28*1024*1024 {
-		t.Fatalf("payload not reduced: %d bytes", len(got))
+	toolResultImage := []byte(`{"role":"user","content":[{"type":"tool_result","tool_use_id":"t","content":[{"type":"image","source":{"type":"base64","media_type":"image/png","data":""}}]}]}`)
+	toolResultImage, _ = sjson.SetBytes(toolResultImage, "content.0.content.0.source.data", pngData)
+	out, _ = sjson.SetRawBytes(out, "messages.-1", toolResultImage)
+
+	got := compressBase64PNGImagesToJPEG(out)
+	gotAgain := compressBase64PNGImagesToJPEG(got)
+
+	if !bytes.Equal(got, gotAgain) {
+		t.Fatalf("JPEG compression should be stable after the first pass")
+	}
+	for _, path := range []string{
+		"messages.0.content.0.source",
+		"messages.1.content.0.content.0.source",
+	} {
+		if mt := gjson.GetBytes(got, path+".media_type").String(); mt != "image/jpeg" {
+			t.Fatalf("%s media_type = %q, want image/jpeg", path, mt)
+		}
+		data := gjson.GetBytes(got, path+".data").String()
+		if len(data) >= len(pngData) {
+			t.Fatalf("%s data length = %d, want smaller than png length %d", path, len(data), len(pngData))
+		}
+		raw, err := base64.StdEncoding.DecodeString(data)
+		if err != nil {
+			t.Fatalf("%s data is not valid base64: %v", path, err)
+		}
+		if len(raw) < 2 || raw[0] != 0xff || raw[1] != 0xd8 {
+			t.Fatalf("%s data is not a JPEG payload", path)
+		}
+	}
+}
+
+func testPNGBase64(t *testing.T) string {
+	t.Helper()
+	return testPNGBase64Size(t, 256, 256)
+}
+
+func testPNGBase64Size(t *testing.T, w, h int) string {
+	t.Helper()
+
+	img := image.NewRGBA(image.Rect(0, 0, w, h))
+	state := uint32(1)
+	for y := 0; y < h; y++ {
+		for x := 0; x < w; x++ {
+			state = state*1664525 + 1013904223
+			r := uint8(state >> 24)
+			state = state*1664525 + 1013904223
+			g := uint8(state >> 24)
+			state = state*1664525 + 1013904223
+			b := uint8(state >> 24)
+			img.SetRGBA(x, y, color.RGBA{
+				R: r,
+				G: g,
+				B: b,
+				A: 255,
+			})
+		}
+	}
+
+	var buf bytes.Buffer
+	if err := png.Encode(&buf, img); err != nil {
+		t.Fatalf("encode png: %v", err)
+	}
+	return base64.StdEncoding.EncodeToString(buf.Bytes())
+}
+
+func TestCompressBase64PNGImagesToJPEG_DownscalesLongEdge(t *testing.T) {
+	pngData := testPNGBase64Size(t, 3200, 1800)
+	out := []byte(`{"messages":[]}`)
+	userImage := []byte(`{"role":"user","content":[{"type":"image","source":{"type":"base64","media_type":"image/png","data":""}}]}`)
+	userImage, _ = sjson.SetBytes(userImage, "content.0.source.data", pngData)
+	out, _ = sjson.SetRawBytes(out, "messages.-1", userImage)
+
+	got := compressBase64PNGImagesToJPEG(out)
+	gotAgain := compressBase64PNGImagesToJPEG(got)
+	if !bytes.Equal(got, gotAgain) {
+		t.Fatalf("downscaled JPEG compression must be stable after first pass")
+	}
+
+	data := gjson.GetBytes(got, "messages.0.content.0.source.data").String()
+	raw, err := base64.StdEncoding.DecodeString(data)
+	if err != nil {
+		t.Fatalf("decode jpeg base64: %v", err)
+	}
+	cfg, _, err := image.DecodeConfig(bytes.NewReader(raw))
+	if err != nil {
+		t.Fatalf("decode jpeg config: %v", err)
+	}
+	if cfg.Width > maxScreenshotLongEdge || cfg.Height > maxScreenshotLongEdge {
+		t.Fatalf("long edge not capped: %dx%d", cfg.Width, cfg.Height)
+	}
+	if cfg.Width != maxScreenshotLongEdge {
+		t.Fatalf("expected width %d, got %d", maxScreenshotLongEdge, cfg.Width)
 	}
 }
