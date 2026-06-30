@@ -13,14 +13,14 @@ import (
 	"github.com/tidwall/sjson"
 )
 
-func TestStripOldImages_KeepsAllImagesBelowHardLine(t *testing.T) {
+func TestMarkPayloadTooLargeForLocalCleanup_KeepsPayloadBelowHardLine(t *testing.T) {
 	out := []byte(`{"messages":[]}`)
 	for i := 0; i < 8; i++ {
 		m := []byte(`{"role":"user","content":[{"type":"image","source":{"type":"base64","media_type":"image/png","data":"QUJD"}}]}`)
 		out, _ = sjson.SetRawBytes(out, "messages.-1", m)
 	}
 
-	got := stripOldImages(out)
+	got := markPayloadTooLargeForLocalCleanup(out)
 
 	for i := 0; i < 8; i++ {
 		if ty := gjson.GetBytes(got, "messages."+string(rune('0'+i))+".content.0.type").String(); ty != "image" {
@@ -29,7 +29,7 @@ func TestStripOldImages_KeepsAllImagesBelowHardLine(t *testing.T) {
 	}
 }
 
-func TestStripOldImages_RemovesAllImagesAboveHardLine(t *testing.T) {
+func TestMarkPayloadTooLargeForLocalCleanup_ReturnsAgentActionAboveHardLine(t *testing.T) {
 	big := strings.Repeat("A", maxClaudePayloadBytesWithImages/2)
 	out := []byte(`{"messages":[]}`)
 
@@ -41,19 +41,19 @@ func TestStripOldImages_RemovesAllImagesAboveHardLine(t *testing.T) {
 	toolResultImage, _ = sjson.SetBytes(toolResultImage, "content.0.content.0.source.data", big)
 	out, _ = sjson.SetRawBytes(out, "messages.-1", toolResultImage)
 
-	got := stripOldImages(out)
+	got := markPayloadTooLargeForLocalCleanup(out)
 
-	if ty := gjson.GetBytes(got, "messages.0.content.0.type").String(); ty != "text" {
-		t.Fatalf("top-level image should be replaced above hard line, got type=%s", ty)
+	if code := gjson.GetBytes(got, "error.code").String(); code != "codex_local_cleanup_required" {
+		t.Fatalf("error.code = %q, want codex_local_cleanup_required; payload=%s", code, got)
 	}
-	if txt := gjson.GetBytes(got, "messages.0.content.0.text").String(); txt != "[image omitted]" {
-		t.Fatalf("top-level image placeholder = %q", txt)
+	if !gjson.GetBytes(got, "cliproxy_local_cleanup_required").Bool() {
+		t.Fatalf("cliproxy_local_cleanup_required marker missing: %s", got)
 	}
-	if ty := gjson.GetBytes(got, "messages.1.content.0.content.0.type").String(); ty != "text" {
-		t.Fatalf("nested tool_result image should be replaced above hard line, got type=%s", ty)
+	if command := gjson.GetBytes(got, "error.param").String(); command != localCleanupCommand {
+		t.Fatalf("cleanup command = %q, want %q", command, localCleanupCommand)
 	}
 	if strings.Contains(string(got), big) {
-		t.Fatalf("image source data should not remain after hard-line stripping")
+		t.Fatalf("error marker should not include image source data")
 	}
 }
 

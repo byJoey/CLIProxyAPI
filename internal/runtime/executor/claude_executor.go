@@ -153,6 +153,43 @@ func NewClaudeExecutor(cfg *config.Config) *ClaudeExecutor { return &ClaudeExecu
 
 func (e *ClaudeExecutor) Identifier() string { return "claude" }
 
+const codexLocalCleanupToolCommand = "codex-prune-rollout-images --current-window --request-mb 31 --apply"
+
+func claudeLocalCleanupRequired(body []byte) bool {
+	if !gjson.GetBytes(body, "cliproxy_local_cleanup_required").Bool() ||
+		strings.TrimSpace(gjson.GetBytes(body, "error.code").String()) != "codex_local_cleanup_required" {
+		return false
+	}
+	return true
+}
+
+func codexLocalCleanupToolCallItem() []byte {
+	args := fmt.Sprintf(`{"cmd":%q,"yield_time_ms":10000,"max_output_tokens":12000}`, codexLocalCleanupToolCommand)
+	item := []byte(`{"id":"fc_local_cleanup_required","type":"function_call","status":"completed","arguments":"","call_id":"call_local_cleanup_required","name":"exec_command"}`)
+	item, _ = sjson.SetBytes(item, "arguments", args)
+	return item
+}
+
+func codexLocalCleanupResponsesPayload() []byte {
+	item := codexLocalCleanupToolCallItem()
+	payload := []byte(`{"id":"resp_local_cleanup_required","object":"response","created_at":0,"status":"completed","background":false,"error":null,"output":[],"usage":{"input_tokens":0,"output_tokens":0,"total_tokens":0}}`)
+	payload, _ = sjson.SetRawBytes(payload, "output.-1", item)
+	return payload
+}
+
+func codexLocalCleanupResponsesStream() *cliproxyexecutor.StreamResult {
+	item := codexLocalCleanupToolCallItem()
+	done := []byte(`{"type":"response.output_item.done","sequence_number":1,"output_index":0,"item":{}}`)
+	done, _ = sjson.SetRawBytes(done, "item", item)
+	completed := []byte(`{"type":"response.completed","sequence_number":2,"response":{"id":"resp_local_cleanup_required","object":"response","created_at":0,"status":"completed","background":false,"error":null,"output":[],"usage":{"input_tokens":0,"output_tokens":0,"total_tokens":0}}}`)
+	completed, _ = sjson.SetRawBytes(completed, "response.output.-1", item)
+	chunks := make(chan cliproxyexecutor.StreamChunk, 2)
+	chunks <- cliproxyexecutor.StreamChunk{Payload: done}
+	chunks <- cliproxyexecutor.StreamChunk{Payload: completed}
+	close(chunks)
+	return &cliproxyexecutor.StreamResult{Chunks: chunks}
+}
+
 // PrepareRequest injects Claude credentials into the outgoing HTTP request.
 func (e *ClaudeExecutor) PrepareRequest(req *http.Request, auth *cliproxyauth.Auth) error {
 	if req == nil {
@@ -220,6 +257,9 @@ func (e *ClaudeExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, r
 	originalPayload := originalPayloadSource
 	originalTranslated := sdktranslator.TranslateRequest(from, to, baseModel, originalPayload, stream)
 	body := sdktranslator.TranslateRequest(from, to, baseModel, req.Payload, stream)
+	if claudeLocalCleanupRequired(body) {
+		return cliproxyexecutor.Response{Payload: codexLocalCleanupResponsesPayload()}, nil
+	}
 	body, _ = sjson.SetBytes(body, "model", baseModel)
 
 	body, err = thinking.ApplyThinking(body, req.Model, from.String(), to.String(), e.Identifier())
@@ -410,6 +450,9 @@ func (e *ClaudeExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
 	originalPayload := originalPayloadSource
 	originalTranslated := sdktranslator.TranslateRequest(from, to, baseModel, originalPayload, true)
 	body := sdktranslator.TranslateRequest(from, to, baseModel, req.Payload, true)
+	if claudeLocalCleanupRequired(body) {
+		return codexLocalCleanupResponsesStream(), nil
+	}
 	body, _ = sjson.SetBytes(body, "model", baseModel)
 
 	body, err = thinking.ApplyThinking(body, req.Model, from.String(), to.String(), e.Identifier())
@@ -686,6 +729,13 @@ func (e *ClaudeExecutor) CountTokens(ctx context.Context, auth *cliproxyauth.Aut
 	// Use streaming translation to preserve function calling, except for claude.
 	stream := from != to
 	body := sdktranslator.TranslateRequest(from, to, baseModel, req.Payload, stream)
+	if claudeLocalCleanupRequired(body) {
+		msg := strings.TrimSpace(gjson.GetBytes(body, "error.message").String())
+		if msg == "" {
+			msg = "claude executor: local Codex cleanup required before count_tokens"
+		}
+		return cliproxyexecutor.Response{}, statusErr{code: http.StatusRequestEntityTooLarge, msg: msg}
+	}
 	body, _ = sjson.SetBytes(body, "model", baseModel)
 	if rebuildMidSystemMessageEnabled(e.cfg, auth) {
 		body = rebuildMidSystemMessagesToTopLevel(body)

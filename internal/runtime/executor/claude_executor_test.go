@@ -36,6 +36,46 @@ func malformedClaudeTreeSignatureForClaudeExecutorTest() string {
 	return base64.StdEncoding.EncodeToString([]byte{0x12, 0xFF, 0xFE, 0xFD})
 }
 
+func TestCodexLocalCleanupResponsesPayloadCallsExecCommand(t *testing.T) {
+	payload := codexLocalCleanupResponsesPayload()
+
+	if got := gjson.GetBytes(payload, "output.0.type").String(); got != "function_call" {
+		t.Fatalf("output.0.type = %q, want function_call. Payload: %s", got, payload)
+	}
+	if got := gjson.GetBytes(payload, "output.0.name").String(); got != "exec_command" {
+		t.Fatalf("output.0.name = %q, want exec_command. Payload: %s", got, payload)
+	}
+	args := gjson.GetBytes(payload, "output.0.arguments").String()
+	if got := gjson.Get(args, "cmd").String(); got != codexLocalCleanupToolCommand {
+		t.Fatalf("tool cmd = %q, want %q. Args: %s", got, codexLocalCleanupToolCommand, args)
+	}
+}
+
+func TestCodexLocalCleanupResponsesStreamCallsExecCommand(t *testing.T) {
+	stream := codexLocalCleanupResponsesStream()
+
+	var chunks [][]byte
+	for chunk := range stream.Chunks {
+		chunks = append(chunks, chunk.Payload)
+	}
+	if len(chunks) != 2 {
+		t.Fatalf("stream chunks = %d, want 2", len(chunks))
+	}
+	if got := gjson.GetBytes(chunks[0], "type").String(); got != "response.output_item.done" {
+		t.Fatalf("first event type = %q, want response.output_item.done. Payload: %s", got, chunks[0])
+	}
+	if got := gjson.GetBytes(chunks[0], "item.name").String(); got != "exec_command" {
+		t.Fatalf("stream item name = %q, want exec_command. Payload: %s", got, chunks[0])
+	}
+	args := gjson.GetBytes(chunks[0], "item.arguments").String()
+	if got := gjson.Get(args, "cmd").String(); got != codexLocalCleanupToolCommand {
+		t.Fatalf("stream tool cmd = %q, want %q. Args: %s", got, codexLocalCleanupToolCommand, args)
+	}
+	if got := gjson.GetBytes(chunks[1], "response.output.0.name").String(); got != "exec_command" {
+		t.Fatalf("completed output name = %q, want exec_command. Payload: %s", got, chunks[1])
+	}
+}
+
 func newClaudeHeaderTestRequest(t *testing.T, incoming http.Header) *http.Request {
 	t.Helper()
 

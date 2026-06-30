@@ -489,7 +489,7 @@ func ConvertOpenAIResponsesRequestToClaude(modelName string, inputRawJSON []byte
 	out = stripModelSwitchPrompt(out)
 	out = truncateLargeToolResults(out)
 	out = compressBase64PNGImagesToJPEG(out)
-	out = stripOldImages(out)
+	out = markPayloadTooLargeForLocalCleanup(out)
 
 	if dumpDir := os.Getenv("CLAUDE_RESPONSES_DUMP_DIR"); dumpDir != "" {
 		n := atomic.AddInt64(&dumpCounter, 1)
@@ -960,29 +960,32 @@ func downscaleToLongEdge(src *image.RGBA, longEdge int) *image.RGBA {
 
 const maxClaudePayloadBytesWithImages = 31 * 1024 * 1024
 
-// stripOldImages keeps image payloads untouched unless the converted Claude
-// request crosses the hard payload line. If it does, all image blocks are
-// removed in one pass so cache invalidation happens as a single event instead
-// of repeatedly as old image turns slide through the conversation.
-func stripOldImages(out []byte) []byte {
+const localCleanupCommand = "codex-prune-rollout-images --current-window --request-mb 31 --apply"
+
+// markPayloadTooLargeForLocalCleanup never mutates the transcript. Codex Desktop
+// resends its local snapshot on every turn, so gateway-side image removal cannot
+// persist and can hide the user's newest screenshot. When the translated payload
+// remains too large after deterministic compression, return a local-only marker
+// for the executor to turn into a Codex tool call on Responses requests.
+func markPayloadTooLargeForLocalCleanup(out []byte) []byte {
 	if len(out) <= maxClaudePayloadBytesWithImages {
 		return out
 	}
 
-	placeholder := []byte(`{"type":"text","text":"[image omitted]"}`)
-
-	for {
-		path := firstImagePath(out)
-		if path == "" {
-			break
-		}
-		nb, err := sjson.SetRawBytes(out, path, placeholder)
-		if err != nil {
-			break
-		}
-		out = nb
-	}
-	return out
+	message := fmt.Sprintf(
+		"Claude request payload is %d bytes after image compression, exceeding the %d byte local safety limit. "+
+			"Do not strip images in the gateway. The agent must clean only the current Codex window by running: %s",
+		len(out),
+		maxClaudePayloadBytesWithImages,
+		localCleanupCommand,
+	)
+	errPayload := []byte(`{"error":{"type":"payload_too_large","code":"codex_local_cleanup_required","message":"","param":""}}`)
+	errPayload, _ = sjson.SetBytes(errPayload, "error.message", message)
+	errPayload, _ = sjson.SetBytes(errPayload, "error.param", localCleanupCommand)
+	errPayload, _ = sjson.SetBytes(errPayload, "cliproxy_local_cleanup_required", true)
+	errPayload, _ = sjson.SetBytes(errPayload, "payload_bytes", len(out))
+	errPayload, _ = sjson.SetBytes(errPayload, "payload_limit_bytes", maxClaudePayloadBytesWithImages)
+	return errPayload
 }
 
 // firstImagePath returns the sjson path of the first image block anywhere in
