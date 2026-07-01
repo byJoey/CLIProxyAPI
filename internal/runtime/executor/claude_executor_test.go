@@ -1560,6 +1560,41 @@ func TestApplyClaudeToolPrefix_SkipsBuiltinToolReference(t *testing.T) {
 	}
 }
 
+func TestDefaultCacheControlTTLToOneHour_AddsTTLToDefaultEphemeralBlocks(t *testing.T) {
+	payload := []byte(`{
+		"cache_control":{"type":"ephemeral"},
+		"tools":[{"name":"t1","cache_control":{"type":"ephemeral"}}],
+		"system":[{"type":"text","text":"s1","cache_control":{"type":"ephemeral"}}],
+		"messages":[{"role":"user","content":[{"type":"text","text":"u1","cache_control":{"type":"ephemeral"}}]}]
+	}`)
+
+	out := defaultCacheControlTTLToOneHour(payload)
+
+	for _, path := range []string{
+		"cache_control.ttl",
+		"tools.0.cache_control.ttl",
+		"system.0.cache_control.ttl",
+		"messages.0.content.0.cache_control.ttl",
+	} {
+		if got := gjson.GetBytes(out, path).String(); got != "1h" {
+			t.Fatalf("%s = %q, want %q", path, got, "1h")
+		}
+	}
+}
+
+func TestDefaultCacheControlTTLToOneHour_PreservesExplicitTTL(t *testing.T) {
+	payload := []byte(`{"tools":[{"name":"t1","cache_control":{"type":"ephemeral","ttl":"5m"}}],"messages":[{"role":"user","content":[{"type":"text","text":"u1","cache_control":{"type":"ephemeral","ttl":"1h"}}]}]}`)
+
+	out := defaultCacheControlTTLToOneHour(payload)
+
+	if got := gjson.GetBytes(out, "tools.0.cache_control.ttl").String(); got != "5m" {
+		t.Fatalf("tools.0.cache_control.ttl = %q, want %q", got, "5m")
+	}
+	if got := gjson.GetBytes(out, "messages.0.content.0.cache_control.ttl").String(); got != "1h" {
+		t.Fatalf("messages.0.content.0.cache_control.ttl = %q, want %q", got, "1h")
+	}
+}
+
 func TestNormalizeCacheControlTTL_DowngradesLaterOneHourBlocks(t *testing.T) {
 	payload := []byte(`{
 		"tools": [{"name":"t1","cache_control":{"type":"ephemeral","ttl":"1h"}}],

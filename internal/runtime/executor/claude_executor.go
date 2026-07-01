@@ -45,6 +45,11 @@ type ClaudeExecutor struct {
 // Previously "proxy_" was used but this is a detectable fingerprint difference.
 const claudeToolPrefix = ""
 
+var claudeOneHourCacheControl = map[string]string{
+	"type": "ephemeral",
+	"ttl":  "1h",
+}
+
 func shouldSanitizeClaudeMessagesForUpstream(baseModel string) bool {
 	return sigcompat.SignatureProviderFromModelName(baseModel) == sigcompat.SignatureProviderClaude
 }
@@ -301,6 +306,9 @@ func (e *ClaudeExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, r
 	// already sends multiple cache_control blocks.
 	body = enforceCacheControlLimit(body, 4)
 
+	// Use Anthropic's 1-hour prompt cache TTL for default ephemeral cache blocks.
+	body = defaultCacheControlTTLToOneHour(body)
+
 	// Normalize TTL values to prevent ordering violations under prompt-caching-scope-2026-01-05.
 	// A 1h-TTL block must not appear after a 5m-TTL block in evaluation order (tools→system→messages).
 	body = normalizeCacheControlTTL(body)
@@ -531,6 +539,9 @@ func (e *ClaudeExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
 
 	// Enforce Anthropic's cache_control block limit (max 4 breakpoints per request).
 	body = enforceCacheControlLimit(body, 4)
+
+	// Use Anthropic's 1-hour prompt cache TTL for default ephemeral cache blocks.
+	body = defaultCacheControlTTLToOneHour(body)
 
 	// Normalize TTL values to prevent ordering violations under prompt-caching-scope-2026-01-05.
 	body = normalizeCacheControlTTL(body)
@@ -795,6 +806,7 @@ func (e *ClaudeExecutor) CountTokens(ctx context.Context, auth *cliproxyauth.Aut
 
 	// Keep count_tokens requests compatible with Anthropic cache-control constraints too.
 	body = enforceCacheControlLimit(body, 4)
+	body = defaultCacheControlTTLToOneHour(body)
 	body = normalizeCacheControlTTL(body)
 
 	// Extract betas from body and convert to header (for count_tokens too)
@@ -2248,6 +2260,70 @@ func countCacheControls(payload []byte) int {
 	return count
 }
 
+// defaultCacheControlTTLToOneHour upgrades default ephemeral cache blocks from
+// Anthropic's implicit 5-minute TTL to the explicit 1-hour TTL. Existing ttl
+// values are preserved so caller-provided short-lived breakpoints remain valid.
+func defaultCacheControlTTLToOneHour(payload []byte) []byte {
+	if len(payload) == 0 || !gjson.ValidBytes(payload) {
+		return payload
+	}
+
+	setDefaultTTL := func(path string, cc gjson.Result) {
+		if !cc.Exists() || !cc.IsObject() {
+			return
+		}
+		if cc.Get("ttl").Exists() {
+			return
+		}
+		if cc.Get("type").String() != "ephemeral" {
+			return
+		}
+		updated, errSet := sjson.SetBytes(payload, path+".ttl", "1h")
+		if errSet != nil {
+			return
+		}
+		payload = updated
+	}
+
+	setDefaultTTL("cache_control", gjson.GetBytes(payload, "cache_control"))
+
+	tools := gjson.GetBytes(payload, "tools")
+	if tools.IsArray() {
+		tools.ForEach(func(idx, item gjson.Result) bool {
+			setDefaultTTL(fmt.Sprintf("tools.%d.cache_control", int(idx.Int())), item.Get("cache_control"))
+			return true
+		})
+	}
+
+	system := gjson.GetBytes(payload, "system")
+	if system.IsArray() {
+		system.ForEach(func(idx, item gjson.Result) bool {
+			setDefaultTTL(fmt.Sprintf("system.%d.cache_control", int(idx.Int())), item.Get("cache_control"))
+			return true
+		})
+	}
+
+	messages := gjson.GetBytes(payload, "messages")
+	if messages.IsArray() {
+		messages.ForEach(func(msgIdx, msg gjson.Result) bool {
+			content := msg.Get("content")
+			if !content.IsArray() {
+				return true
+			}
+			content.ForEach(func(contentIdx, item gjson.Result) bool {
+				setDefaultTTL(
+					fmt.Sprintf("messages.%d.content.%d.cache_control", int(msgIdx.Int()), int(contentIdx.Int())),
+					item.Get("cache_control"),
+				)
+				return true
+			})
+			return true
+		})
+	}
+
+	return payload
+}
+
 // normalizeCacheControlTTL ensures cache_control TTL values don't violate the
 // prompt-caching-scope-2026-01-05 ordering constraint: a 1h-TTL block must not
 // appear after a 5m-TTL block anywhere in the evaluation order.
@@ -2567,7 +2643,7 @@ func injectMessagesCacheControl(payload []byte) []byte {
 		contentCount := int(content.Get("#").Int())
 		if contentCount > 0 {
 			cacheControlPath := fmt.Sprintf("messages.%d.content.%d.cache_control", secondToLastUserIdx, contentCount-1)
-			result, err := sjson.SetBytes(payload, cacheControlPath, map[string]string{"type": "ephemeral"})
+			result, err := sjson.SetBytes(payload, cacheControlPath, claudeOneHourCacheControl)
 			if err != nil {
 				log.Warnf("failed to inject cache_control into messages: %v", err)
 				return payload
@@ -2579,11 +2655,9 @@ func injectMessagesCacheControl(payload []byte) []byte {
 		text := content.String()
 		newContent := []map[string]interface{}{
 			{
-				"type": "text",
-				"text": text,
-				"cache_control": map[string]string{
-					"type": "ephemeral",
-				},
+				"type":          "text",
+				"text":          text,
+				"cache_control": claudeOneHourCacheControl,
 			},
 		}
 		result, err := sjson.SetBytes(payload, contentPath, newContent)
@@ -2626,7 +2700,7 @@ func injectToolsCacheControl(payload []byte) []byte {
 
 	// Add cache_control to the last tool
 	lastToolPath := fmt.Sprintf("tools.%d.cache_control", toolCount-1)
-	result, err := sjson.SetBytes(payload, lastToolPath, map[string]string{"type": "ephemeral"})
+	result, err := sjson.SetBytes(payload, lastToolPath, claudeOneHourCacheControl)
 	if err != nil {
 		log.Warnf("failed to inject cache_control into tools array: %v", err)
 		return payload
@@ -2665,7 +2739,7 @@ func injectSystemCacheControl(payload []byte) []byte {
 
 		// Add cache_control to the last system element
 		lastSystemPath := fmt.Sprintf("system.%d.cache_control", count-1)
-		result, err := sjson.SetBytes(payload, lastSystemPath, map[string]string{"type": "ephemeral"})
+		result, err := sjson.SetBytes(payload, lastSystemPath, claudeOneHourCacheControl)
 		if err != nil {
 			log.Warnf("failed to inject cache_control into system array: %v", err)
 			return payload
@@ -2673,15 +2747,13 @@ func injectSystemCacheControl(payload []byte) []byte {
 		payload = result
 	} else if system.Type == gjson.String {
 		// Convert string system prompt to array with cache_control
-		// "system": "text" -> "system": [{"type": "text", "text": "text", "cache_control": {"type": "ephemeral"}}]
+		// "system": "text" -> "system": [{"type": "text", "text": "text", "cache_control": {"type": "ephemeral", "ttl": "1h"}}]
 		text := system.String()
 		newSystem := []map[string]interface{}{
 			{
-				"type": "text",
-				"text": text,
-				"cache_control": map[string]string{
-					"type": "ephemeral",
-				},
+				"type":          "text",
+				"text":          text,
+				"cache_control": claudeOneHourCacheControl,
 			},
 		}
 		result, err := sjson.SetBytes(payload, "system", newSystem)
