@@ -500,8 +500,6 @@ func ConvertOpenAIResponsesRequestToClaude(modelName string, inputRawJSON []byte
 	}
 
 	out = normalizeMessageContent(out)
-	out = stripModelSwitchPrompt(out)
-	out = truncateLargeToolResults(out)
 	out = compressBase64PNGImagesToJPEG(out)
 	out = markPayloadTooLargeForLocalCleanup(out)
 
@@ -1060,65 +1058,6 @@ func normalizeMessageContent(out []byte) []byte {
 			path := fmt.Sprintf("messages.%d.content", mi.Int())
 			out, _ = sjson.SetRawBytes(out, path, arr)
 		}
-		return true
-	})
-	return out
-}
-
-// stripModelSwitchPrompt detects <model_switch> blocks that contain a full
-// duplicate of the system prompt and replaces them with a short summary.
-// This saves ~5,700 tokens per occurrence (typically 3x in a long session).
-func stripModelSwitchPrompt(out []byte) []byte {
-	const tag = "<model_switch>"
-	const replacement = "<model_switch>\nThe user switched models. Continue the conversation following the system instructions from the first message.\n</model_switch>"
-
-	gjson.GetBytes(out, "messages").ForEach(func(mi, msg gjson.Result) bool {
-		content := msg.Get("content")
-		if !content.IsArray() {
-			return true
-		}
-		content.ForEach(func(ci, part gjson.Result) bool {
-			if part.Get("type").String() != "text" {
-				return true
-			}
-			text := part.Get("text").String()
-			if len(text) > 1000 && strings.Contains(text, tag) {
-				path := fmt.Sprintf("messages.%d.content.%d.text", mi.Int(), ci.Int())
-				out, _ = sjson.SetBytes(out, path, replacement)
-			}
-			return true
-		})
-		return true
-	})
-	return out
-}
-
-// truncateLargeToolResults truncates tool_result content strings that exceed
-// a threshold, keeping the head and tail to preserve useful context while
-// cutting out the middle bulk. This targets cases like large log dumps that
-// bloat the payload without adding value to later turns.
-func truncateLargeToolResults(out []byte) []byte {
-	const maxLen = 8192
-	const keepEach = 2048
-
-	gjson.GetBytes(out, "messages").ForEach(func(mi, msg gjson.Result) bool {
-		content := msg.Get("content")
-		if !content.IsArray() {
-			return true
-		}
-		content.ForEach(func(ci, part gjson.Result) bool {
-			if part.Get("type").String() != "tool_result" {
-				return true
-			}
-			inner := part.Get("content")
-			if inner.Type == gjson.String && len(inner.String()) > maxLen {
-				text := inner.String()
-				truncated := text[:keepEach] + "\n\n[...truncated " + fmt.Sprintf("%d", len(text)-2*keepEach) + " chars...]\n\n" + text[len(text)-keepEach:]
-				path := fmt.Sprintf("messages.%d.content.%d.content", mi.Int(), ci.Int())
-				out, _ = sjson.SetBytes(out, path, truncated)
-			}
-			return true
-		})
 		return true
 	})
 	return out
