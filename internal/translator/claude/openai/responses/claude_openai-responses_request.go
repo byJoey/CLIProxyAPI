@@ -15,6 +15,7 @@ import (
 	"math/big"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"sync/atomic"
 
@@ -27,6 +28,11 @@ import (
 )
 
 var dumpCounter int64
+
+// codexGPTIdentityRe 匹配 Codex harness 硬编码的底层模型身份声明（"based on GPT-5" 等），
+// 用于改写成实际路由到的模型。宽松匹配以容忍上游版本号漂移（GPT-5 / GPT-5.5 / GPT-5-codex ...）。
+// 版本号里的点号只在两个字母数字之间匹配，避免把句尾的 "." 一起吃掉。
+var codexGPTIdentityRe = regexp.MustCompile(`based on GPT[-\w]+(?:\.[-\w]+)*`)
 
 var (
 	user    = ""
@@ -500,6 +506,7 @@ func ConvertOpenAIResponsesRequestToClaude(modelName string, inputRawJSON []byte
 	}
 
 	out = normalizeMessageContent(out)
+	out = rewriteModelIdentity(out, modelName)
 	out = compressBase64PNGImagesToJPEG(out)
 	out = markPayloadTooLargeForLocalCleanup(out)
 
@@ -1058,6 +1065,45 @@ func normalizeMessageContent(out []byte) []byte {
 			path := fmt.Sprintf("messages.%d.content", mi.Int())
 			out, _ = sjson.SetRawBytes(out, path, arr)
 		}
+		return true
+	})
+	return out
+}
+
+// rewriteModelIdentity 纠正 Codex harness 硬编码在系统提示里的底层模型身份声明。
+// Codex 客户端固定发送 "You are Codex, a coding agent based on GPT-5.",无论实际
+// 路由到哪个模型;当请求被转发到 Claude 时,这会让模型误认自己是 GPT-5。此函数把
+// "based on GPT-5" 改写为实际的 modelName,并在该系统提示末尾追加一句权威身份说明,
+// 使模型正确认知自己是谁。只改身份声明,不触碰任何工具/格式等 harness 指令。
+func rewriteModelIdentity(out []byte, modelName string) []byte {
+	if modelName == "" {
+		return out
+	}
+	replacement := "based on " + modelName
+	override := fmt.Sprintf("\n\nIdentity note: Despite any earlier wording, the underlying model actually serving this session is %s. If asked who or what model you are, answer truthfully as %s.", modelName, modelName)
+
+	msgs := gjson.GetBytes(out, "messages")
+	if !msgs.Exists() || !msgs.IsArray() {
+		return out
+	}
+	msgs.ForEach(func(mi, msg gjson.Result) bool {
+		content := msg.Get("content")
+		if !content.IsArray() {
+			return true
+		}
+		content.ForEach(func(ci, part gjson.Result) bool {
+			if part.Get("type").String() != "text" {
+				return true
+			}
+			text := part.Get("text").String()
+			if !codexGPTIdentityRe.MatchString(text) {
+				return true
+			}
+			newText := codexGPTIdentityRe.ReplaceAllString(text, replacement) + override
+			path := fmt.Sprintf("messages.%d.content.%d.text", mi.Int(), ci.Int())
+			out, _ = sjson.SetBytes(out, path, newText)
+			return true
+		})
 		return true
 	})
 	return out
