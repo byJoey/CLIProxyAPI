@@ -34,6 +34,15 @@ var dumpCounter int64
 // 版本号里的点号只在两个字母数字之间匹配，避免把句尾的 "." 一起吃掉。
 var codexGPTIdentityRe = regexp.MustCompile(`based on GPT[-\w]+(?:\.[-\w]+)*`)
 
+// codexHarnessMarkers 用于识别 Codex harness 的系统提示首块。2026-08 起上游改了
+// 开场措辞（不再出现 "based on GPT-x"），仅靠 codexGPTIdentityRe 会整段漏匹配，
+// 导致身份尾注也不再追加。这里改为按 harness 特征串定位，命中即追加身份说明。
+var codexHarnessMarkers = []string{
+	"You are Codex",
+	"coding agent running in the Codex CLI",
+	"Codex CLI is an open source project",
+}
+
 var (
 	user    = ""
 	account = ""
@@ -1071,21 +1080,27 @@ func normalizeMessageContent(out []byte) []byte {
 }
 
 // rewriteModelIdentity 纠正 Codex harness 硬编码在系统提示里的底层模型身份声明。
-// Codex 客户端固定发送 "You are Codex, a coding agent based on GPT-5.",无论实际
-// 路由到哪个模型;当请求被转发到 Claude 时,这会让模型误认自己是 GPT-5。此函数把
-// "based on GPT-5" 改写为实际的 modelName,并在该系统提示末尾追加一句权威身份说明,
-// 使模型正确认知自己是谁。只改身份声明,不触碰任何工具/格式等 harness 指令。
+// Codex 客户端的 instructions 会声明自己基于 OpenAI 的模型（早期是
+// "You are Codex, a coding agent based on GPT-5."，2026-08 起改成
+// "You are a coding agent running in the Codex CLI ... led by OpenAI."），
+// 无论实际路由到哪个模型;当请求被转发到 Claude 时,这会让模型误认自己是 GPT。
+// 此函数把 "based on GPT-x"（若存在）改写为实际的 modelName,并在 harness 系统提示
+// 末尾追加一句权威身份说明。只改身份声明,不触碰任何工具/格式等 harness 指令。
+//
+// 关键：追加身份尾注的条件不再依赖 "based on GPT-x" 是否命中,而是看该文本块是否为
+// Codex harness 提示（codexHarnessMarkers）。上游改措辞时不会再整体失效。
 func rewriteModelIdentity(out []byte, modelName string) []byte {
 	if modelName == "" {
 		return out
 	}
 	replacement := "based on " + modelName
-	override := fmt.Sprintf("\n\nIdentity note: Despite any earlier wording, the underlying model actually serving this session is %s. If asked who or what model you are, answer truthfully as %s.", modelName, modelName)
+	override := fmt.Sprintf("\n\nIdentity note: Despite any earlier wording, the underlying model actually serving this session is %s, made by Anthropic. You are not an OpenAI model. The Codex CLI is only the harness/interface you run inside. If asked who or what model you are, answer truthfully as %s.", modelName, modelName)
 
 	msgs := gjson.GetBytes(out, "messages")
 	if !msgs.Exists() || !msgs.IsArray() {
 		return out
 	}
+	done := false
 	msgs.ForEach(func(mi, msg gjson.Result) bool {
 		content := msg.Get("content")
 		if !content.IsArray() {
@@ -1096,17 +1111,37 @@ func rewriteModelIdentity(out []byte, modelName string) []byte {
 				return true
 			}
 			text := part.Get("text").String()
-			if !codexGPTIdentityRe.MatchString(text) {
+			hasGPT := codexGPTIdentityRe.MatchString(text)
+			if !hasGPT && !isCodexHarnessPrompt(text) {
 				return true
 			}
-			newText := codexGPTIdentityRe.ReplaceAllString(text, replacement) + override
+			if strings.Contains(text, "Identity note: Despite any earlier wording") {
+				done = true
+				return false
+			}
+			newText := text
+			if hasGPT {
+				newText = codexGPTIdentityRe.ReplaceAllString(newText, replacement)
+			}
+			newText += override
 			path := fmt.Sprintf("messages.%d.content.%d.text", mi.Int(), ci.Int())
 			out, _ = sjson.SetBytes(out, path, newText)
-			return true
+			done = true
+			return false
 		})
-		return true
+		return !done
 	})
 	return out
+}
+
+// isCodexHarnessPrompt 判断一段文本是否为 Codex harness 的系统提示。
+func isCodexHarnessPrompt(text string) bool {
+	for _, marker := range codexHarnessMarkers {
+		if strings.Contains(text, marker) {
+			return true
+		}
+	}
+	return false
 }
 
 // claudeBase64ImageBytes 统计 messages 中所有 base64 image 块的 data 字节长度,
