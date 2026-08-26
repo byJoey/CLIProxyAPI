@@ -626,10 +626,14 @@ func convertResponsesToolToClaudeTools(tool gjson.Result, toolNameMap map[string
 			}
 			return [][]byte{tJSON}
 		}
-	default:
+	case "custom":
 		if isOpenAIResponsesApplyPatchCustomTool(toolType, tool) {
 			return nil
 		}
+		if tJSON, ok := convertResponsesFunctionToolToClaude(tool, ""); ok {
+			return [][]byte{tJSON}
+		}
+	default:
 		if isUnsupportedOpenAIBuiltinToolType(toolType) {
 			return nil
 		}
@@ -746,6 +750,9 @@ func normalizeClaudeToolInputSchema(parameters gjson.Result) []byte {
 	if !result.IsObject() {
 		return []byte(`{"type":"object","properties":{}}`)
 	}
+	if hasTopLevelSchemaCombiner(result) {
+		return []byte(`{"type":"object","properties":{}}`)
+	}
 	schema := []byte(raw)
 	schemaType := result.Get("type").String()
 	if schemaType == "" {
@@ -756,6 +763,15 @@ func normalizeClaudeToolInputSchema(parameters gjson.Result) []byte {
 		schema, _ = sjson.SetRawBytes(schema, "properties", []byte(`{}`))
 	}
 	return schema
+}
+
+func hasTopLevelSchemaCombiner(schema gjson.Result) bool {
+	for _, key := range []string{"oneOf", "allOf", "anyOf"} {
+		if schema.Get(key).Exists() {
+			return true
+		}
+	}
+	return false
 }
 
 func qualifyResponsesNamespaceToolName(namespaceName, childName string) string {

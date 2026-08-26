@@ -262,6 +262,42 @@ func TestConvertOpenAIResponsesRequestToClaude_DropsApplyPatchCustomTool(t *test
 	}
 }
 
+func TestConvertOpenAIResponsesRequestToClaude_DowngradesCustomToolSchemaCombiners(t *testing.T) {
+	raw := []byte(`{
+		"model":"claude-test",
+		"input":[{"role":"user","content":[{"type":"input_text","text":"hi"}]}],
+		"tools":[
+			{
+				"type":"custom",
+				"name":"custom_lookup",
+				"description":"Lookup custom data.",
+				"input_schema":{
+					"oneOf":[
+						{"type":"object","properties":{"q":{"type":"string"}},"required":["q"]},
+						{"type":"object","properties":{"id":{"type":"string"}},"required":["id"]}
+					]
+				}
+			}
+		]
+	}`)
+
+	out := ConvertOpenAIResponsesRequestToClaude("claude-test", raw, false)
+	root := gjson.ParseBytes(out)
+
+	if got := root.Get("tools.#").Int(); got != 1 {
+		t.Fatalf("tools count = %d, want 1. Output: %s", got, string(out))
+	}
+	if got := root.Get("tools.0.name").String(); got != "custom_lookup" {
+		t.Fatalf("tools.0.name = %q, want custom_lookup. Output: %s", got, string(out))
+	}
+	if got := root.Get("tools.0.input_schema.type").String(); got != "object" {
+		t.Fatalf("input_schema.type = %q, want object. Output: %s", got, string(out))
+	}
+	if root.Get("tools.0.input_schema.oneOf").Exists() {
+		t.Fatalf("top-level oneOf should be removed. Output: %s", string(out))
+	}
+}
+
 func TestConvertOpenAIResponsesRequestToClaude_InputImageFileID(t *testing.T) {
 	raw := []byte(`{
 		"model":"claude-test",
