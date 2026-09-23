@@ -1,8 +1,20 @@
 package responses
 
 import (
+	"bytes"
+	"encoding/base64"
+	"fmt"
+	"image"
+	"image/color"
+	"image/draw"
+	"image/jpeg"
+	_ "image/png"
+	"os"
+	"path/filepath"
+	"regexp"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"unicode/utf16"
 
 	log "github.com/sirupsen/logrus"
@@ -15,6 +27,22 @@ import (
 	"github.com/tidwall/gjson"
 	"github.com/tidwall/sjson"
 )
+
+var dumpCounter int64
+
+// codexGPTIdentityRe 匹配 Codex harness 硬编码的底层模型身份声明（"based on GPT-5" 等），
+// 用于改写成实际路由到的模型。宽松匹配以容忍上游版本号漂移（GPT-5 / GPT-5.5 / GPT-5-codex ...）。
+// 版本号里的点号只在两个字母数字之间匹配，避免把句尾的 "." 一起吃掉。
+var codexGPTIdentityRe = regexp.MustCompile(`based on GPT[-\w]+(?:\.[-\w]+)*`)
+
+// codexHarnessMarkers 用于识别 Codex harness 的系统提示首块。2026-08 起上游改了
+// 开场措辞（不再出现 "based on GPT-x"），仅靠 codexGPTIdentityRe 会整段漏匹配，
+// 导致身份尾注也不再追加。这里改为按 harness 特征串定位，命中即追加身份说明。
+var codexHarnessMarkers = []string{
+	"You are Codex",
+	"coding agent running in the Codex CLI",
+	"Codex CLI is an open source project",
+}
 
 const (
 	defaultClaudeResponsesMaxTokens = 32000
@@ -621,6 +649,15 @@ func convertOpenAIResponsesRequestToClaude(modelName string, inputRawJSON []byte
 		default:
 
 		}
+	}
+
+	out = rewriteModelIdentity(out, modelName)
+	out = compressBase64PNGImagesToJPEG(out)
+	out = markPayloadTooLargeForLocalCleanup(out)
+
+	if dumpDir := os.Getenv("CLAUDE_RESPONSES_DUMP_DIR"); dumpDir != "" {
+		n := atomic.AddInt64(&dumpCounter, 1)
+		_ = os.WriteFile(filepath.Join(dumpDir, fmt.Sprintf("claude_out_%d.json", n)), out, 0o644)
 	}
 
 	return out
@@ -1691,4 +1728,336 @@ func normalizeCodexAgentMessages(payload []byte) []byte {
 		return payload
 	}
 	return updated
+}
+
+// ===== 以下为本 fork 自有补丁 =====
+
+const (
+	jpegScreenshotQuality = 75
+	maxScreenshotLongEdge = 1600
+)
+
+type base64ImagePath struct {
+	mediaTypePath string
+	dataPath      string
+}
+
+// compressBase64PNGImagesToJPEG converts inline PNG screenshots to stable JPEG
+// payloads before the hard payload cap is applied. JPEG inputs are left alone
+// to avoid repeated lossy re-encoding across turns.
+func compressBase64PNGImagesToJPEG(out []byte) []byte {
+	for _, path := range base64ImagePaths(out) {
+		mediaType := strings.ToLower(strings.TrimSpace(gjson.GetBytes(out, path.mediaTypePath).String()))
+		if mediaType != "image/png" && mediaType != "image/x-png" {
+			continue
+		}
+		data := gjson.GetBytes(out, path.dataPath).String()
+		jpegData, ok := compressPNGBase64ToJPEGBase64(data)
+		if !ok || len(jpegData) >= len(data) {
+			continue
+		}
+		var err error
+		out, err = sjson.SetBytes(out, path.mediaTypePath, "image/jpeg")
+		if err != nil {
+			continue
+		}
+		out, err = sjson.SetBytes(out, path.dataPath, jpegData)
+		if err != nil {
+			continue
+		}
+	}
+	return out
+}
+
+func base64ImagePaths(out []byte) []base64ImagePath {
+	var paths []base64ImagePath
+	gjson.GetBytes(out, "messages").ForEach(func(mi, msg gjson.Result) bool {
+		content := msg.Get("content")
+		if !content.IsArray() {
+			return true
+		}
+		content.ForEach(func(ci, part gjson.Result) bool {
+			switch part.Get("type").String() {
+			case "image":
+				if part.Get("source.type").String() == "base64" {
+					base := fmt.Sprintf("messages.%d.content.%d.source", mi.Int(), ci.Int())
+					paths = append(paths, base64ImagePath{
+						mediaTypePath: base + ".media_type",
+						dataPath:      base + ".data",
+					})
+				}
+			case "tool_result":
+				inner := part.Get("content")
+				if inner.IsArray() {
+					inner.ForEach(func(ii, ipart gjson.Result) bool {
+						if ipart.Get("type").String() == "image" && ipart.Get("source.type").String() == "base64" {
+							base := fmt.Sprintf("messages.%d.content.%d.content.%d.source", mi.Int(), ci.Int(), ii.Int())
+							paths = append(paths, base64ImagePath{
+								mediaTypePath: base + ".media_type",
+								dataPath:      base + ".data",
+							})
+						}
+						return true
+					})
+				}
+			}
+			return true
+		})
+		return true
+	})
+	return paths
+}
+
+func compressPNGBase64ToJPEGBase64(data string) (string, bool) {
+	raw, err := base64.StdEncoding.DecodeString(data)
+	if err != nil {
+		return "", false
+	}
+	img, format, err := image.Decode(bytes.NewReader(raw))
+	if err != nil || format != "png" {
+		return "", false
+	}
+
+	bounds := img.Bounds()
+	flattened := image.NewRGBA(image.Rect(0, 0, bounds.Dx(), bounds.Dy()))
+	draw.Draw(flattened, flattened.Bounds(), &image.Uniform{C: color.White}, image.Point{}, draw.Src)
+	draw.Draw(flattened, flattened.Bounds(), img, bounds.Min, draw.Over)
+
+	scaled := downscaleToLongEdge(flattened, maxScreenshotLongEdge)
+
+	var buf bytes.Buffer
+	if err := jpeg.Encode(&buf, scaled, &jpeg.Options{Quality: jpegScreenshotQuality}); err != nil {
+		return "", false
+	}
+	return base64.StdEncoding.EncodeToString(buf.Bytes()), true
+}
+
+// downscaleToLongEdge returns a deterministic box-averaged copy of src whose
+// longest edge is at most longEdge. Images already within the limit are
+// returned unchanged so the transform stays idempotent.
+func downscaleToLongEdge(src *image.RGBA, longEdge int) *image.RGBA {
+	w := src.Bounds().Dx()
+	h := src.Bounds().Dy()
+	if longEdge <= 0 || (w <= longEdge && h <= longEdge) {
+		return src
+	}
+
+	dw, dh := w, h
+	if w >= h {
+		dw = longEdge
+		dh = (h*longEdge + w/2) / w
+	} else {
+		dh = longEdge
+		dw = (w*longEdge + h/2) / h
+	}
+	if dw < 1 {
+		dw = 1
+	}
+	if dh < 1 {
+		dh = 1
+	}
+
+	dst := image.NewRGBA(image.Rect(0, 0, dw, dh))
+	for dy := 0; dy < dh; dy++ {
+		sy0 := dy * h / dh
+		sy1 := (dy + 1) * h / dh
+		if sy1 <= sy0 {
+			sy1 = sy0 + 1
+		}
+		for dx := 0; dx < dw; dx++ {
+			sx0 := dx * w / dw
+			sx1 := (dx + 1) * w / dw
+			if sx1 <= sx0 {
+				sx1 = sx0 + 1
+			}
+			var rsum, gsum, bsum, asum, count uint64
+			for sy := sy0; sy < sy1; sy++ {
+				row := src.PixOffset(src.Bounds().Min.X+sx0, src.Bounds().Min.Y+sy)
+				for sx := sx0; sx < sx1; sx++ {
+					i := row + (sx-sx0)*4
+					rsum += uint64(src.Pix[i])
+					gsum += uint64(src.Pix[i+1])
+					bsum += uint64(src.Pix[i+2])
+					asum += uint64(src.Pix[i+3])
+					count++
+				}
+			}
+			di := dst.PixOffset(dx, dy)
+			dst.Pix[di] = uint8(rsum / count)
+			dst.Pix[di+1] = uint8(gsum / count)
+			dst.Pix[di+2] = uint8(bsum / count)
+			dst.Pix[di+3] = uint8(asum / count)
+		}
+	}
+	return dst
+}
+
+const maxClaudePayloadBytesWithImages = 31 * 1024 * 1024
+
+const localCleanupCommand = "codex-prune-rollout-images --current-window --request-mb 31 --apply"
+
+// markPayloadTooLargeForLocalCleanup never mutates the transcript. Codex Desktop
+// resends its local snapshot on every turn, so gateway-side image removal cannot
+// persist and can hide the user's newest screenshot. When the translated payload
+// remains too large after deterministic compression, return a local-only marker
+// for the executor to turn into a Codex tool call on Responses requests.
+func markPayloadTooLargeForLocalCleanup(out []byte) []byte {
+	// 图片 base64 会在 executor 阶段上传 Files API 并替换为 file_id 引用,
+	// 真正出公网的请求体不含这些字节,因此超限判断要扣除图片体积,只在
+	// 非图片内容本身超过硬上限时才要求本地清理。
+	effectiveBytes := len(out) - claudeBase64ImageBytes(out)
+	if effectiveBytes <= maxClaudePayloadBytesWithImages {
+		return out
+	}
+
+	message := fmt.Sprintf(
+		"Claude request payload is %d bytes after image compression, exceeding the %d byte local safety limit. "+
+			"Do not strip images in the gateway. The agent must clean only the current Codex window by running: %s",
+		effectiveBytes,
+		maxClaudePayloadBytesWithImages,
+		localCleanupCommand,
+	)
+	errPayload := []byte(`{"error":{"type":"payload_too_large","code":"codex_local_cleanup_required","message":"","param":""}}`)
+	errPayload, _ = sjson.SetBytes(errPayload, "error.message", message)
+	errPayload, _ = sjson.SetBytes(errPayload, "error.param", localCleanupCommand)
+	errPayload, _ = sjson.SetBytes(errPayload, "cliproxy_local_cleanup_required", true)
+	errPayload, _ = sjson.SetBytes(errPayload, "payload_bytes", effectiveBytes)
+	errPayload, _ = sjson.SetBytes(errPayload, "payload_limit_bytes", maxClaudePayloadBytesWithImages)
+	return errPayload
+}
+
+// firstImagePath returns the sjson path of the first image block anywhere in
+// the messages array, including images nested inside tool_result content.
+func firstImagePath(out []byte) string {
+	found := ""
+	gjson.GetBytes(out, "messages").ForEach(func(mi, msg gjson.Result) bool {
+		content := msg.Get("content")
+		if !content.IsArray() {
+			return true
+		}
+		content.ForEach(func(ci, part gjson.Result) bool {
+			switch part.Get("type").String() {
+			case "image":
+				found = fmt.Sprintf("messages.%d.content.%d", mi.Int(), ci.Int())
+				return false
+			case "tool_result":
+				inner := part.Get("content")
+				if inner.IsArray() {
+					inner.ForEach(func(ii, ipart gjson.Result) bool {
+						if ipart.Get("type").String() == "image" {
+							found = fmt.Sprintf("messages.%d.content.%d.content.%d", mi.Int(), ci.Int(), ii.Int())
+							return false
+						}
+						return true
+					})
+				}
+				if found != "" {
+					return false
+				}
+			}
+			return true
+		})
+		return found == ""
+	})
+	return found
+}
+
+// rewriteModelIdentity 纠正 Codex harness 硬编码在系统提示里的底层模型身份声明。
+// Codex 客户端的 instructions 会声明自己基于 OpenAI 的模型（早期是
+// "You are Codex, a coding agent based on GPT-5."，2026-08 起改成
+// "You are a coding agent running in the Codex CLI ... led by OpenAI."），
+// 无论实际路由到哪个模型;当请求被转发到 Claude 时,这会让模型误认自己是 GPT。
+// 此函数把 "based on GPT-x"（若存在）改写为实际的 modelName,并在 harness 系统提示
+// 末尾追加一句权威身份说明。只改身份声明,不触碰任何工具/格式等 harness 指令。
+//
+// 关键：追加身份尾注的条件不再依赖 "based on GPT-x" 是否命中,而是看该文本块是否为
+// Codex harness 提示（codexHarnessMarkers）。上游改措辞时不会再整体失效。
+func rewriteModelIdentity(out []byte, modelName string) []byte {
+	if modelName == "" {
+		return out
+	}
+	replacement := "based on " + modelName
+	override := fmt.Sprintf("\n\nIdentity note: Despite any earlier wording, the underlying model actually serving this session is %s, made by Anthropic. You are not an OpenAI model. The Codex CLI is only the harness/interface you run inside. If asked who or what model you are, answer truthfully as %s.", modelName, modelName)
+
+	msgs := gjson.GetBytes(out, "messages")
+	if !msgs.Exists() || !msgs.IsArray() {
+		return out
+	}
+	done := false
+	msgs.ForEach(func(mi, msg gjson.Result) bool {
+		content := msg.Get("content")
+		if !content.IsArray() {
+			return true
+		}
+		content.ForEach(func(ci, part gjson.Result) bool {
+			if part.Get("type").String() != "text" {
+				return true
+			}
+			text := part.Get("text").String()
+			hasGPT := codexGPTIdentityRe.MatchString(text)
+			if !hasGPT && !isCodexHarnessPrompt(text) {
+				return true
+			}
+			if strings.Contains(text, "Identity note: Despite any earlier wording") {
+				done = true
+				return false
+			}
+			newText := text
+			if hasGPT {
+				newText = codexGPTIdentityRe.ReplaceAllString(newText, replacement)
+			}
+			newText += override
+			path := fmt.Sprintf("messages.%d.content.%d.text", mi.Int(), ci.Int())
+			out, _ = sjson.SetBytes(out, path, newText)
+			done = true
+			return false
+		})
+		return !done
+	})
+	return out
+}
+
+// isCodexHarnessPrompt 判断一段文本是否为 Codex harness 的系统提示。
+func isCodexHarnessPrompt(text string) bool {
+	for _, marker := range codexHarnessMarkers {
+		if strings.Contains(text, marker) {
+			return true
+		}
+	}
+	return false
+}
+
+// claudeBase64ImageBytes 统计 messages 中所有 base64 image 块的 data 字节长度,
+// 含 tool_result 内嵌图片。用于把图片体积从超限判断里扣除,因为这些图片随后会
+// 被 executor 上传 Files API 并替换为 file_id 引用。
+func claudeBase64ImageBytes(out []byte) int {
+	total := 0
+	addImage := func(part gjson.Result) {
+		if part.Get("type").String() != "image" {
+			return
+		}
+		source := part.Get("source")
+		if source.Get("type").String() != "base64" {
+			return
+		}
+		total += len(source.Get("data").String())
+	}
+	gjson.GetBytes(out, "messages").ForEach(func(_, msg gjson.Result) bool {
+		content := msg.Get("content")
+		if !content.IsArray() {
+			return true
+		}
+		content.ForEach(func(_, part gjson.Result) bool {
+			addImage(part)
+			if part.Get("type").String() == "tool_result" {
+				part.Get("content").ForEach(func(_, npart gjson.Result) bool {
+					addImage(npart)
+					return true
+				})
+			}
+			return true
+		})
+		return true
+	})
+	return total
 }

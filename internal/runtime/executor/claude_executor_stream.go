@@ -81,12 +81,17 @@ func (e *ClaudeExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
 
 	isCompat := helps.APIKeyModelIsCompat(req)
 	originalTranslated, body := helps.TranslateRequestPairWithAPIKeyModelCompatibility(ctx, opts.Headers, e.cfg, from, to, baseModel, originalPayload, req.Payload, true, isCompat)
+	if claudeLocalCleanupRequired(body) {
+		return codexLocalCleanupResponsesStream(), nil
+	}
 	body = helps.SetStringIfDifferent(body, "model", upstreamModel)
 
 	body, err = helps.ApplyRequestThinking(body, req, opts, from.String(), to.String(), e.Identifier())
 	if err != nil {
 		return nil, err
 	}
+	var claudeImagesUploaded bool
+	body, claudeImagesUploaded = e.uploadClaudeImagesToFileIDs(ctx, auth, body, baseModel)
 	if rebuildMidSystemMessageEnabled(e.cfg, auth) {
 		body = rebuildMidSystemMessagesToTopLevel(body)
 	}
@@ -249,6 +254,9 @@ func (e *ClaudeExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
 	// Extract betas from body and convert to header
 	var extraBetas []string
 	extraBetas, body = extractAndRemoveBetas(body)
+	if claudeImagesUploaded {
+		extraBetas = appendBetaIfMissing(extraBetas, claudeFilesAPIBeta)
+	}
 	bodyForTranslation := body
 	bodyForUpstream := body
 	var oauthToolNamesReverseMap map[string]string

@@ -24,6 +24,7 @@ import (
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/registry"
 	"github.com/router-for-me/CLIProxyAPI/v7/sdk/api/handlers"
 	coreauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
+	coreexecutor "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/executor"
 	log "github.com/sirupsen/logrus"
 	"github.com/tidwall/gjson"
 	"github.com/tidwall/sjson"
@@ -59,6 +60,64 @@ func (h *ClaudeCodeAPIHandler) Models() []map[string]any {
 	// Get dynamic models from the global registry
 	modelRegistry := registry.GetGlobalRegistry()
 	return modelRegistry.GetAvailableModels("claude")
+}
+
+// ClaudeFiles proxies Anthropic Files API uploads through the configured Claude
+// credential so local clients can upload once and reuse returned file IDs.
+func (h *ClaudeCodeAPIHandler) ClaudeFiles(c *gin.Context) {
+	rawBody, err := c.GetRawData()
+	if err != nil {
+		c.JSON(http.StatusBadRequest, handlers.ErrorResponse{
+			Error: handlers.ErrorDetail{
+				Message: fmt.Sprintf("Invalid request: %v", err),
+				Type:    "invalid_request_error",
+			},
+		})
+		return
+	}
+	if h.AuthManager == nil {
+		c.JSON(http.StatusInternalServerError, handlers.ErrorResponse{
+			Error: handlers.ErrorDetail{
+				Message: "Claude auth manager is unavailable",
+				Type:    "server_error",
+			},
+		})
+		return
+	}
+
+	modelName := strings.TrimSpace(c.Query("model"))
+	if modelName == "" {
+		modelName = strings.TrimSpace(c.GetHeader("X-Codex-Preflight-Model"))
+	}
+	if modelName == "" || !strings.HasPrefix(strings.ToLower(modelName), "claude-") {
+		modelName = "claude-opus-5"
+	}
+
+	cliCtx, cliCancel := h.GetContextWithCancel(h, c, context.Background())
+	resp, err := h.AuthManager.Execute(cliCtx, []string{h.HandlerType()}, coreexecutor.Request{
+		Model:   modelName,
+		Payload: rawBody,
+	}, coreexecutor.Options{
+		Alt:     "claude/files",
+		Headers: c.Request.Header.Clone(),
+	})
+	if err != nil {
+		status := http.StatusInternalServerError
+		if se, ok := err.(interface{ StatusCode() int }); ok && se != nil && se.StatusCode() > 0 {
+			status = se.StatusCode()
+		}
+		c.Data(status, "application/json", handlers.BuildErrorResponseBody(status, err.Error()))
+		cliCancel(err)
+		return
+	}
+
+	handlers.WriteUpstreamHeaders(c.Writer.Header(), resp.Headers)
+	if c.Writer.Header().Get("Content-Type") == "" {
+		c.Writer.Header().Set("Content-Type", "application/json")
+	}
+	c.Status(http.StatusOK)
+	_, _ = c.Writer.Write(resp.Payload)
+	cliCancel(resp.Payload)
 }
 
 // ClaudeMessages handles Claude-compatible streaming chat completions.
