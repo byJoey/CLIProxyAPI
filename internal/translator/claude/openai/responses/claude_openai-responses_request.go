@@ -1972,48 +1972,40 @@ func firstImagePath(out []byte) string {
 //
 // 关键：追加身份尾注的条件不再依赖 "based on GPT-x" 是否命中,而是看该文本块是否为
 // Codex harness 提示（codexHarnessMarkers）。上游改措辞时不会再整体失效。
+//
+// 只扫顶层 system：上游把 instructions 和 system/developer 角色的输入都收进了顶层
+// system 数组，harness 提示只会在这里。messages 是用户和助手的对话内容，不能碰。
+// 早先按 messages 扫时，harness 在 system 里扫不到，尾注反而贴到了第一条提到
+// "based on GPT-x" 的历史消息上，等于篡改对话。
 func rewriteModelIdentity(out []byte, modelName string) []byte {
 	if modelName == "" {
+		return out
+	}
+	system := gjson.GetBytes(out, "system")
+	if !system.IsArray() {
 		return out
 	}
 	replacement := "based on " + modelName
 	override := fmt.Sprintf("\n\nIdentity note: Despite any earlier wording, the underlying model actually serving this session is %s, made by Anthropic. You are not an OpenAI model. The Codex CLI is only the harness/interface you run inside. If asked who or what model you are, answer truthfully as %s.", modelName, modelName)
 
-	msgs := gjson.GetBytes(out, "messages")
-	if !msgs.Exists() || !msgs.IsArray() {
+	for i, block := range system.Array() {
+		if block.Get("type").String() != "text" {
+			continue
+		}
+		text := block.Get("text").String()
+		hasGPT := codexGPTIdentityRe.MatchString(text)
+		if !hasGPT && !isCodexHarnessPrompt(text) {
+			continue
+		}
+		if strings.Contains(text, "Identity note: Despite any earlier wording") {
+			return out
+		}
+		if hasGPT {
+			text = codexGPTIdentityRe.ReplaceAllString(text, replacement)
+		}
+		out, _ = sjson.SetBytes(out, fmt.Sprintf("system.%d.text", i), text+override)
 		return out
 	}
-	done := false
-	msgs.ForEach(func(mi, msg gjson.Result) bool {
-		content := msg.Get("content")
-		if !content.IsArray() {
-			return true
-		}
-		content.ForEach(func(ci, part gjson.Result) bool {
-			if part.Get("type").String() != "text" {
-				return true
-			}
-			text := part.Get("text").String()
-			hasGPT := codexGPTIdentityRe.MatchString(text)
-			if !hasGPT && !isCodexHarnessPrompt(text) {
-				return true
-			}
-			if strings.Contains(text, "Identity note: Despite any earlier wording") {
-				done = true
-				return false
-			}
-			newText := text
-			if hasGPT {
-				newText = codexGPTIdentityRe.ReplaceAllString(newText, replacement)
-			}
-			newText += override
-			path := fmt.Sprintf("messages.%d.content.%d.text", mi.Int(), ci.Int())
-			out, _ = sjson.SetBytes(out, path, newText)
-			done = true
-			return false
-		})
-		return !done
-	})
 	return out
 }
 
